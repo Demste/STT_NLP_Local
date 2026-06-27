@@ -1,0 +1,6 @@
+If Unity Gradle cannot resolve com.alphacephei:vosk-android:0.3.75, enable Custom Main Gradle Template and make sure repositories include:
+
+google()
+mavenCentral()
+
+Most Unity 6 Android builds already include these repositories.
