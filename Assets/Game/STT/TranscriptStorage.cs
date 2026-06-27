@@ -5,70 +5,88 @@ using UnityEngine;
 
 namespace Game.STT
 {
-    public sealed class TranscriptStorage
+    public sealed class STTSessionStorage
     {
+        private readonly DateTime _createdAt;
+
         public string RootDirectory { get; }
-        public string LogCsvPath { get; }
+        public string SessionId { get; }
+        public string SessionDirectory { get; }
+        public string AudioSessionDirectory { get; }
+        public string ResultTxtPath { get; }
+        public string PublicRelativeDirectory { get; }
+        public string PublicFolderDisplayPath { get; }
+        public string PublicResultDisplayPath { get; }
 
-        public TranscriptStorage()
+        public STTSessionStorage(string language)
         {
-            RootDirectory = Path.Combine(Application.persistentDataPath, "STTTests");
+            _createdAt = DateTime.Now;
+            RootDirectory = BuildExternalRootDirectory();
+            SessionId = "session_" + _createdAt.ToString("yyyyMMdd_HHmmss");
+            SessionDirectory = Path.Combine(RootDirectory, "Sessions", SessionId);
+            AudioSessionDirectory = Path.Combine(RootDirectory, "Audio", SessionId);
+            ResultTxtPath = Path.Combine(SessionDirectory, "result.txt");
+            PublicRelativeDirectory = "Documents/PartTime/STT/" + SessionId;
+            PublicFolderDisplayPath = "Internal Storage/" + PublicRelativeDirectory;
+            PublicResultDisplayPath = PublicFolderDisplayPath + "/result.txt";
+
             Directory.CreateDirectory(RootDirectory);
-            LogCsvPath = Path.Combine(RootDirectory, "result_log.csv");
-            EnsureCsvHeader();
+            Directory.CreateDirectory(SessionDirectory);
+            Directory.CreateDirectory(AudioSessionDirectory);
+            EnsureSessionFile(language);
         }
 
-        public string BuildAudioPath(string recordingId)
+        public static string BuildExternalRootDirectory()
         {
-            return Path.Combine(RootDirectory, $"audio_{recordingId}.wav");
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+            using AndroidJavaObject activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
+            using AndroidJavaObject documentsDir = activity.Call<AndroidJavaObject>("getExternalFilesDir", "Documents");
+            string documentsPath = documentsDir.Call<string>("getAbsolutePath");
+            return Path.Combine(documentsPath, "PartTime", "STT");
+#else
+            return Path.Combine(Application.persistentDataPath, "PartTime", "STT");
+#endif
         }
 
-        public string BuildTranscriptPath(string recordingId, STTProvider provider)
+        public string BuildAudioPath(string recordingLabel, string timestamp)
         {
-            return Path.Combine(RootDirectory, $"transcript_{recordingId}_{provider.ToSafeFileName()}.txt");
+            return Path.Combine(AudioSessionDirectory, $"audio_{recordingLabel}_{timestamp}.wav");
         }
 
-        public void SaveTranscript(string path, STTResult result)
+        public void EnsureSessionFile(string language)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? RootDirectory);
+            if (File.Exists(ResultTxtPath)) return;
+
             string text =
-                $"provider: {result.provider}\n" +
-                $"language: {result.language}\n" +
-                $"durationMs: {result.durationMs}\n" +
-                $"audioFile: {result.audioFile}\n" +
-                $"error: {result.error}\n\n" +
-                $"text:\n{result.text}\n";
-            File.WriteAllText(path, text, Encoding.UTF8);
+                $"SessionId: {SessionId}\n" +
+                $"CreatedAt: {_createdAt:yyyy-MM-dd HH:mm:ss}\n" +
+                $"Language: {language}\n\n";
+            File.WriteAllText(ResultTxtPath, text, Encoding.UTF8);
         }
 
-        public void AppendCsv(string timestamp, string recordingId, string audioPath, string transcriptPath, STTResult result)
+        public void AppendRecordingHeader(string recordingLabel, string audioPath)
         {
-            EnsureCsvHeader();
-            string line = string.Join(",", new[]
-            {
-                Escape(timestamp),
-                Escape(recordingId),
-                Escape(result.provider),
-                Escape(audioPath),
-                Escape(transcriptPath),
-                Escape(result.durationMs.ToString()),
-                Escape(result.text),
-                Escape(result.error)
-            });
-            File.AppendAllText(LogCsvPath, line + Environment.NewLine, Encoding.UTF8);
+            string text =
+                $"[{recordingLabel}]\n" +
+                $"AudioFile: {audioPath}\n";
+            File.AppendAllText(ResultTxtPath, text, Encoding.UTF8);
         }
 
-        private void EnsureCsvHeader()
+        public void AppendModelOutput(STTProvider provider, STTResult result)
         {
-            if (File.Exists(LogCsvPath)) return;
-            File.WriteAllText(LogCsvPath, "timestamp,recordingId,provider,audioFile,transcriptFile,durationMs,text,error" + Environment.NewLine, Encoding.UTF8);
+            string output = result != null && result.HasError
+                ? "HATA: " + result.error
+                : result?.text ?? string.Empty;
+
+            long durationMs = result?.durationMs ?? 0;
+            string line = $"{provider.ToDisplayName()}: {output} ({durationMs} ms)\n";
+            File.AppendAllText(ResultTxtPath, line, Encoding.UTF8);
         }
 
-        private static string Escape(string value)
+        public void AppendRecordingSeparator()
         {
-            value ??= string.Empty;
-            value = value.Replace("\r", " ").Replace("\n", " ").Replace("\"", "\"\"");
-            return $"\"{value}\"";
+            File.AppendAllText(ResultTxtPath, "\n", Encoding.UTF8);
         }
     }
 }

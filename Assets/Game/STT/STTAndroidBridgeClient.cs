@@ -39,5 +39,25 @@ namespace Game.STT
             if (target != null) target.SendMessage(unityCallbackMethod, json, SendMessageOptions.DontRequireReceiver);
 #endif
         }
+
+        public bool ShareTextFile(string txtPath)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            return bridge.CallStatic<bool>("shareTextFile", txtPath);
+#else
+            return false;
+#endif
+        }
+
+        public bool ExportFileToPublicDocuments(string sourcePath, string sessionId, string mimeType)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            return bridge.CallStatic<bool>("exportFileToPublicDocuments", sourcePath, sessionId, mimeType);
+#else
+            return false;
+#endif
+        }
     }
 }

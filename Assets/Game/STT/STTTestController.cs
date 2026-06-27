@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -8,11 +9,13 @@ namespace Game.STT
 {
     public sealed class STTTestController : MonoBehaviour
     {
+        private const float BridgeTimeoutSeconds = 60f;
+
         [Header("Language")]
         [SerializeField] private string language = "tr";
 
         [Header("ElevenLabs")]
-        [Tooltip("Test için Inspector'dan verilebilir. Daha güvenli seçenek: UI input ile runtime gir.")]
+        [Tooltip("Test icin Inspector'dan verilebilir. Daha guvenli secenek: UI input ile runtime gir.")]
         [SerializeField] private string elevenLabsApiKeyForLocalTest = string.Empty;
         [SerializeField] private TMP_InputField elevenLabsApiKeyInput;
 
@@ -22,18 +25,21 @@ namespace Game.STT
 
         [Header("UI")]
         [SerializeField] private TMP_Dropdown providerDropdown;
-        [SerializeField] private Button transcribeLastSelectedButton;
-        [SerializeField] private Button runAllProvidersButton;
+        [SerializeField] private Button shareTxtButton;
         [SerializeField] private TMP_Text statusText;
         [SerializeField] private TMP_Text transcriptText;
         [SerializeField] private TMP_Text resultsText;
         [SerializeField] private TMP_Text filePathText;
 
         private MicrophoneRecorder _recorder;
-        private TranscriptStorage _storage;
+        private STTSessionStorage _storage;
         private STTAndroidBridgeClient _bridgeClient;
-        private string _lastRecordingId;
         private string _lastWavPath;
+        private string _lastRecordingLabel;
+        private string _expectedProviderApi;
+        private string _expectedAudioPath;
+        private int _recordingIndex;
+        private STTProvider _activeProvider;
         private bool _busy;
 
         private bool _pendingCompleted;
@@ -42,47 +48,38 @@ namespace Game.STT
         private void Awake()
         {
             _recorder = new MicrophoneRecorder(sampleRate, maxRecordSeconds);
-            _storage = new TranscriptStorage();
+            _storage = new STTSessionStorage(language);
             _bridgeClient = new STTAndroidBridgeClient();
 
             SetupDropdown();
 
-            if (transcribeLastSelectedButton != null)
+            if (shareTxtButton != null)
             {
-                transcribeLastSelectedButton.onClick.AddListener(TranscribeLastWithSelectedProvider);
+                shareTxtButton.onClick.AddListener(ShareTxt);
             }
 
-            if (runAllProvidersButton != null)
-            {
-                runAllProvidersButton.onClick.AddListener(RunAllProvidersOnLastRecording);
-            }
-
-            SetStatus("Hazır. Düğmeye basılı tut ve konuş.");
+            SetStatus("Hazir. Bas ve Konus dugmesine basili tut.");
             SetFilesText();
         }
 
         private void OnDestroy()
         {
-            if (transcribeLastSelectedButton != null)
+            if (shareTxtButton != null)
             {
-                transcribeLastSelectedButton.onClick.RemoveListener(TranscribeLastWithSelectedProvider);
-            }
-
-            if (runAllProvidersButton != null)
-            {
-                runAllProvidersButton.onClick.RemoveListener(RunAllProvidersOnLastRecording);
+                shareTxtButton.onClick.RemoveListener(ShareTxt);
             }
         }
 
         private void SetupDropdown()
         {
             if (providerDropdown == null) return;
+
             providerDropdown.ClearOptions();
-            providerDropdown.AddOptions(new System.Collections.Generic.List<string>
+            providerDropdown.AddOptions(new List<string>
             {
+                "Both (Vosk + Whisper)",
                 STTProvider.VoskTurkishOffline.ToDisplayName(),
-                STTProvider.WhisperCppOffline.ToDisplayName(),
-                // STTProvider.ElevenLabsScribeV2.ToDisplayName()
+                STTProvider.WhisperCppOffline.ToDisplayName()
             });
             providerDropdown.value = 0;
         }
@@ -91,19 +88,19 @@ namespace Game.STT
         {
             if (_busy)
             {
-                SetStatus("Şu an işlem devam ediyor, bitince tekrar dene.");
+                SetStatus("Su an islem devam ediyor, bitince tekrar dene.");
                 return;
             }
 
             try
             {
                 _recorder.Start();
-                SetStatus("Kayıt alınıyor... Parmağını bırakınca duracak.");
+                SetStatus("Kayit basladi...");
                 if (transcriptText != null) transcriptText.text = string.Empty;
             }
             catch (Exception ex)
             {
-                SetStatus("Kayıt başlatılamadı: " + ex.Message);
+                SetStatus("Kayit baslatilamadi: " + ex.Message);
             }
         }
 
@@ -125,17 +122,22 @@ namespace Game.STT
             catch (Exception ex)
             {
                 _busy = false;
-                SetStatus("Kayıt durdurulamadı: " + ex.Message);
+                SetStatus("Kayit durdurulamadi: " + ex.Message);
                 yield break;
             }
 
-            _lastRecordingId = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-            _lastWavPath = _storage.BuildAudioPath(_lastRecordingId);
+            _lastRecordingLabel = GetNextRecordingLabel();
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+            _lastWavPath = _storage.BuildAudioPath(_lastRecordingLabel, timestamp);
 
             try
             {
                 WavEncoder.SaveToFile(clip, _lastWavPath);
-                SetStatus("Ses kaydedildi. Seçili modele gönderiliyor...");
+                _storage.AppendRecordingHeader(_lastRecordingLabel, _lastWavPath);
+                bool audioExported = ExportLastAudioToPublicDocuments();
+                SetStatus(audioExported
+                    ? "Ses kaydedildi ve public Documents klasorune kopyalandi."
+                    : "Kayit app storage'a yazildi ama public Documents export basarisiz oldu. Share TXT ile paylasabilirsin.");
                 SetFilesText();
             }
             catch (Exception ex)
@@ -145,68 +147,29 @@ namespace Game.STT
                 yield break;
             }
 
-            yield return CoTranscribeAndStore(GetSelectedProvider(), appendToResults: false);
+            foreach (STTProvider provider in GetSelectedProviders())
+            {
+                yield return CoTranscribeAndStore(provider);
+            }
+
+            _storage.AppendRecordingSeparator();
+            bool resultExported = ExportResultToPublicDocuments();
+            SetFilesText();
+            SetStatus(resultExported
+                ? "result.txt guncellendi ve Documents klasorune kopyalandi."
+                : "Kayit app storage'a yazildi ama public Documents export basarisiz oldu. Share TXT ile paylasabilirsin.");
             _busy = false;
         }
 
-        public void TranscribeLastWithSelectedProvider()
+        private IEnumerator CoTranscribeAndStore(STTProvider provider)
         {
-            if (_busy) return;
-            if (string.IsNullOrWhiteSpace(_lastWavPath))
-            {
-                SetStatus("Önce bir ses kaydı al.");
-                return;
-            }
-
-            StartCoroutine(CoTranscribeLastSelected());
-        }
-
-        private IEnumerator CoTranscribeLastSelected()
-        {
-            _busy = true;
-            yield return CoTranscribeAndStore(GetSelectedProvider(), appendToResults: true);
-            _busy = false;
-        }
-
-        public void RunAllProvidersOnLastRecording()
-        {
-            if (_busy) return;
-            if (string.IsNullOrWhiteSpace(_lastWavPath))
-            {
-                SetStatus("Önce bir ses kaydı al.");
-                return;
-            }
-
-            StartCoroutine(CoRunAllProviders());
-        }
-
-        private IEnumerator CoRunAllProviders()
-        {
-            _busy = true;
-            if (resultsText != null) resultsText.text = string.Empty;
-
-            STTProvider[] providers =
-            {
-                STTProvider.VoskTurkishOffline,
-                STTProvider.WhisperCppOffline,
-                // STTProvider.ElevenLabsScribeV2
-            };
-
-            foreach (STTProvider provider in providers)
-            {
-                yield return CoTranscribeAndStore(provider, appendToResults: true);
-            }
-
-            SetStatus("Tüm model testleri tamamlandı.");
-            _busy = false;
-        }
-
-        private IEnumerator CoTranscribeAndStore(STTProvider provider, bool appendToResults)
-        {
+            _activeProvider = provider;
+            _expectedProviderApi = provider.ToApiValue();
+            _expectedAudioPath = _lastWavPath;
             _pendingCompleted = false;
             _pendingResult = null;
 
-            SetStatus($"{provider.ToDisplayName()} çevriliyor...");
+            SetStatus($"{provider.ToDisplayName()} cevriliyor...");
             _bridgeClient.Transcribe(
                 provider,
                 _lastWavPath,
@@ -216,84 +179,134 @@ namespace Game.STT
                 nameof(OnAndroidSTTResult)
             );
 
-            while (!_pendingCompleted) yield return null;
+            float started = Time.realtimeSinceStartup;
+            while (!_pendingCompleted && Time.realtimeSinceStartup - started < BridgeTimeoutSeconds)
+            {
+                yield return null;
+            }
 
-            STTResult result = _pendingResult ?? new STTResult
+            STTResult result = _pendingResult;
+            if (!_pendingCompleted)
+            {
+                result = BuildErrorResult(provider, "Android bridge callback timeout.");
+            }
+            else if (result == null)
+            {
+                result = BuildErrorResult(provider, "Bridge result null dondu.");
+            }
+
+            _storage.AppendModelOutput(provider, result);
+
+            string modelOutput = result.HasError ? "HATA: " + result.error : result.text;
+            string line = $"{_lastRecordingLabel} {provider.ToDisplayName()}: {modelOutput} ({result.durationMs} ms)";
+
+            if (transcriptText != null) transcriptText.text = result.HasError ? result.error : result.text;
+            if (resultsText != null) resultsText.text = (resultsText.text + "\n" + line).Trim();
+        }
+
+        // Android Java bridge UnityPlayer.UnitySendMessage ile burayi cagirir.
+        public void OnAndroidSTTResult(string json)
+        {
+            try
+            {
+                STTResult parsed = JsonUtility.FromJson<STTResult>(json);
+
+                if (parsed == null)
+                {
+                    _pendingResult = BuildErrorResult(_activeProvider, "JSON parse sonucu null. Raw: " + json);
+                    _pendingCompleted = true;
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(_expectedProviderApi) && parsed.provider != _expectedProviderApi)
+                {
+                    Debug.LogWarning($"[STT] Eski/farkli provider callback ignore edildi. Expected={_expectedProviderApi}, Got={parsed.provider}");
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(_expectedAudioPath) &&
+                    !string.IsNullOrEmpty(parsed.audioFile) &&
+                    parsed.audioFile != _expectedAudioPath)
+                {
+                    Debug.LogWarning($"[STT] Eski/farkli audio callback ignore edildi. Expected={_expectedAudioPath}, Got={parsed.audioFile}");
+                    return;
+                }
+
+                _pendingResult = parsed;
+                _pendingCompleted = true;
+            }
+            catch (Exception ex)
+            {
+                _pendingResult = BuildErrorResult(_activeProvider, "JSON parse hatasi: " + ex.Message + " Raw: " + json);
+                _pendingCompleted = true;
+            }
+        }
+
+        public void ShareTxt()
+        {
+            if (_recordingIndex == 0)
+            {
+                SetStatus("Paylasilacak kayit yok.");
+                return;
+            }
+
+            if (_storage == null || string.IsNullOrWhiteSpace(_storage.ResultTxtPath) || !System.IO.File.Exists(_storage.ResultTxtPath))
+            {
+                SetStatus("Paylasilacak TXT dosyasi yok.");
+                return;
+            }
+
+            bool started = _bridgeClient.ShareTextFile(_storage.ResultTxtPath);
+            SetStatus(started ? "TXT paylasimi acildi." : "Share TXT sadece Android build icinde calisir.");
+        }
+
+        private STTProvider[] GetSelectedProviders()
+        {
+            int value = providerDropdown != null ? providerDropdown.value : 0;
+            return value switch
+            {
+                0 => new[] { STTProvider.VoskTurkishOffline, STTProvider.WhisperCppOffline },
+                1 => new[] { STTProvider.VoskTurkishOffline },
+                2 => new[] { STTProvider.WhisperCppOffline },
+                _ => new[] { STTProvider.VoskTurkishOffline, STTProvider.WhisperCppOffline }
+            };
+        }
+
+        private bool ExportLastAudioToPublicDocuments()
+        {
+            if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_lastWavPath)) return false;
+            return _bridgeClient.ExportFileToPublicDocuments(_lastWavPath, _storage.SessionId, "audio/wav");
+        }
+
+        private bool ExportResultToPublicDocuments()
+        {
+            if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_storage.ResultTxtPath)) return false;
+            return _bridgeClient.ExportFileToPublicDocuments(_storage.ResultTxtPath, _storage.SessionId, "text/plain");
+        }
+
+        private string GetNextRecordingLabel()
+        {
+            int index = _recordingIndex++;
+
+            if (index < 26)
+            {
+                char label = (char)('a' + index);
+                return label.ToString();
+            }
+
+            return $"recording_{index + 1:000}";
+        }
+
+        private STTResult BuildErrorResult(STTProvider provider, string error)
+        {
+            return new STTResult
             {
                 provider = provider.ToApiValue(),
                 language = language,
                 text = string.Empty,
                 durationMs = 0,
                 audioFile = _lastWavPath,
-                error = "Bridge result null döndü."
-            };
-
-            string transcriptPath = _storage.BuildTranscriptPath(_lastRecordingId, provider);
-            _storage.SaveTranscript(transcriptPath, result);
-            _storage.AppendCsv(DateTime.Now.ToString("o"), _lastRecordingId, _lastWavPath, transcriptPath, result);
-
-            string line = result.HasError
-                ? $"[{provider.ToDisplayName()}] HATA: {result.error}"
-                : $"[{provider.ToDisplayName()}] {result.text} ({result.durationMs} ms)";
-
-            if (transcriptText != null) transcriptText.text = result.HasError ? result.error : result.text;
-            if (resultsText != null)
-            {
-                resultsText.text = appendToResults
-                    ? (resultsText.text + "\n" + line).Trim()
-                    : line;
-            }
-
-            SetStatus(result.HasError ? "Hata oluştu." : "Tamamlandı.");
-            SetFilesText(transcriptPath);
-        }
-
-        // Android Java bridge UnityPlayer.UnitySendMessage ile burayı çağırır.
-        public void OnAndroidSTTResult(string json)
-        {
-            try
-            {
-                _pendingResult = JsonUtility.FromJson<STTResult>(json);
-                if (_pendingResult == null)
-                {
-                    _pendingResult = new STTResult
-                    {
-                        provider = GetSelectedProvider().ToApiValue(),
-                        language = language,
-                        text = string.Empty,
-                        durationMs = 0,
-                        audioFile = _lastWavPath,
-                        error = "JSON parse sonucu null. Raw: " + json
-                    };
-                }
-            }
-            catch (Exception ex)
-            {
-                _pendingResult = new STTResult
-                {
-                    provider = GetSelectedProvider().ToApiValue(),
-                    language = language,
-                    text = string.Empty,
-                    durationMs = 0,
-                    audioFile = _lastWavPath,
-                    error = "JSON parse hatası: " + ex.Message + " Raw: " + json
-                };
-            }
-            finally
-            {
-                _pendingCompleted = true;
-            }
-        }
-
-        private STTProvider GetSelectedProvider()
-        {
-            int value = providerDropdown != null ? providerDropdown.value : 0;
-            return value switch
-            {
-                0 => STTProvider.VoskTurkishOffline,
-                1 => STTProvider.WhisperCppOffline,
-                // 2 => STTProvider.ElevenLabsScribeV2,
-                _ => STTProvider.VoskTurkishOffline
+                error = error
             };
         }
 
@@ -313,14 +326,17 @@ namespace Game.STT
             Debug.Log("[STT] " + message);
         }
 
-        private void SetFilesText(string lastTranscriptPath = null)
+        private void SetFilesText()
         {
-            if (filePathText == null) return;
+            if (filePathText == null || _storage == null) return;
+
             filePathText.text =
-                $"Root: {_storage.RootDirectory}\n" +
-                $"Last audio: {_lastWavPath}\n" +
-                $"Last transcript: {lastTranscriptPath}\n" +
-                $"CSV: {_storage.LogCsvPath}";
+                $"App storage root: {_storage.RootDirectory}\n" +
+                $"Session: {_storage.SessionId}\n" +
+                $"App result: {_storage.ResultTxtPath}\n" +
+                $"App last audio: {_lastWavPath}\n" +
+                $"Public visible folder: {_storage.PublicFolderDisplayPath}\n" +
+                $"Public result: {_storage.PublicResultDisplayPath}";
         }
     }
 }

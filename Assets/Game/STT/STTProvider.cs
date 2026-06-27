@@ -24,8 +24,8 @@ namespace Game.STT
         {
             return provider switch
             {
-                STTProvider.VoskTurkishOffline => "Vosk Turkish Offline",
-                STTProvider.WhisperCppOffline => "whisper.cpp Offline",
+                STTProvider.VoskTurkishOffline => "Vosk Turkish Small Offline",
+                STTProvider.WhisperCppOffline => "Whisper.cpp Offline",
                 STTProvider.ElevenLabsScribeV2 => "ElevenLabs Scribe v2",
                 _ => provider.ToString()
             };
