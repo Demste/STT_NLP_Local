@@ -64,7 +64,11 @@ namespace Game.STT
         public static void SaveToFile(AudioClip clip, string path)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? string.Empty);
-            File.WriteAllBytes(path, FromAudioClip(clip, forceMono: true));
+            byte[] wavBytes = FromAudioClip(clip, forceMono: true);
+
+            using FileStream stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+            stream.Write(wavBytes, 0, wavBytes.Length);
+            stream.Flush(true);
         }
 
         private static void WriteSample(BinaryWriter writer, float sample)

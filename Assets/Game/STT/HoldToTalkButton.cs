@@ -3,7 +3,7 @@ using UnityEngine.EventSystems;
 
 namespace Game.STT
 {
-    public sealed class HoldToTalkButton : MonoBehaviour, IPointerDownHandler, IPointerUpHandler, IPointerExitHandler
+    public sealed class HoldToTalkButton : MonoBehaviour, IPointerDownHandler, IPointerUpHandler
     {
         [SerializeField] private STTTestController controller;
         private bool _isHolding;
@@ -20,13 +20,9 @@ namespace Game.STT
             EndHold();
         }
 
-        public void OnPointerExit(PointerEventData eventData)
+        private void OnDisable()
         {
-            // Mobile kullanıcı parmağı butondan kaydırırsa kayıt takılı kalmasın.
-            if (_isHolding && eventData.pointerPress == gameObject)
-            {
-                EndHold();
-            }
+            EndHold();
         }
 
         private void EndHold()

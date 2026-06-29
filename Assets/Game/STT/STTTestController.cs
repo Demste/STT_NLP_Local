@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -22,6 +23,7 @@ namespace Game.STT
         [Header("Recording")]
         [SerializeField] private int sampleRate = 16000;
         [SerializeField] private int maxRecordSeconds = 30;
+        [SerializeField] private float recordingTailSeconds = 0.35f;
 
         [Header("UI")]
         [SerializeField] private TMP_Dropdown providerDropdown;
@@ -38,6 +40,7 @@ namespace Game.STT
         private string _lastRecordingLabel;
         private string _expectedProviderApi;
         private string _expectedAudioPath;
+        private string _lastRecordingDebugLine;
         private int _recordingIndex;
         private STTProvider _activeProvider;
         private bool _busy;
@@ -115,6 +118,12 @@ namespace Game.STT
             _busy = true;
 
             AudioClip clip;
+            if (_recorder.IsRecording && recordingTailSeconds > 0f)
+            {
+                SetStatus("Kayit bitiriliyor...");
+                yield return new WaitForSeconds(recordingTailSeconds);
+            }
+
             try
             {
                 clip = _recorder.StopAndGetClip();
@@ -133,6 +142,14 @@ namespace Game.STT
             try
             {
                 WavEncoder.SaveToFile(clip, _lastWavPath);
+                long wavFileSizeBytes = GetFileSizeBytes(_lastWavPath);
+                _lastRecordingDebugLine =
+                    $"Recorded: {_recorder.LastRecordedDurationSeconds:F2}s, " +
+                    $"samples={_recorder.LastRecordedSamples}, " +
+                    $"channels={_recorder.LastChannels}, " +
+                    $"freq={_recorder.LastFrequency}, " +
+                    $"tail={recordingTailSeconds:F2}s, " +
+                    $"wav={wavFileSizeBytes} bytes";
                 _storage.AppendRecordingHeader(_lastRecordingLabel, _lastWavPath);
                 bool audioExported = ExportLastAudioToPublicDocuments();
                 SetStatus(audioExported
@@ -275,13 +292,26 @@ namespace Game.STT
         private bool ExportLastAudioToPublicDocuments()
         {
             if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_lastWavPath)) return false;
+            if (!HasUsableFile(_lastWavPath, 44)) return false;
             return _bridgeClient.ExportFileToPublicDocuments(_lastWavPath, _storage.SessionId, "audio/wav");
         }
 
         private bool ExportResultToPublicDocuments()
         {
             if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_storage.ResultTxtPath)) return false;
+            if (!HasUsableFile(_storage.ResultTxtPath, 0)) return false;
             return _bridgeClient.ExportFileToPublicDocuments(_storage.ResultTxtPath, _storage.SessionId, "text/plain");
+        }
+
+        private static bool HasUsableFile(string path, long minSizeBytes)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return false;
+            return new FileInfo(path).Length > minSizeBytes;
+        }
+
+        private static long GetFileSizeBytes(string path)
+        {
+            return File.Exists(path) ? new FileInfo(path).Length : 0;
         }
 
         private string GetNextRecordingLabel()
@@ -336,7 +366,8 @@ namespace Game.STT
                 $"App result: {_storage.ResultTxtPath}\n" +
                 $"App last audio: {_lastWavPath}\n" +
                 $"Public visible folder: {_storage.PublicFolderDisplayPath}\n" +
-                $"Public result: {_storage.PublicResultDisplayPath}";
+                $"Public result: {_storage.PublicResultDisplayPath}\n" +
+                $"{_lastRecordingDebugLine}";
         }
     }
 }
