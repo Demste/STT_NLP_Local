@@ -1,0 +1,109 @@
+spaCy / Chaquopy NLP bridge notes
+=================================
+
+Current build failure being diagnosed
+-------------------------------------
+Unity Android deploy/build currently fails before Java runtime:
+
+  :unityLibrary:STTBridge.androidlib:extractDebugPythonBuildPackages
+
+The first safe fix attempt is to reduce Chaquopy package extraction risk:
+
+  - keep only install "spacy==3.8.7" inside the Chaquopy pip block
+  - remove manual click/pydantic pins for now
+  - do not use extractPackages for now
+  - skip tr_core_news_md-*.dist-info by default
+
+Extra dependency pins and vendored dist-info metadata can force Chaquopy's
+Android package resolver into incompatible dependency constraints before the
+app ever reaches Java or device runtime.
+
+Model vendoring
+---------------
+Run this from the Unity project root:
+
+  powershell -ExecutionPolicy Bypass -File Assets\Plugins\Android\STTBridge.androidlib\download_tr_core_news_md.ps1
+
+The script downloads the wheel from HuggingFace, unpacks it as a zip/wheel, and
+copies the package folder into:
+
+  Assets\Plugins\Android\STTBridge.androidlib\src\main\python\
+
+Expected default vendored folder:
+
+  tr_core_news_md\
+
+By default the script removes and skips:
+
+  tr_core_news_md-*.dist-info\
+
+That dist-info folder may declare spaCy >=3.4.2,<3.5.0 while the Android build
+uses Chaquopy with spaCy 3.8.7. The parser loads the model through direct package
+import, so dist-info is not required for the primary load path.
+
+Use this only for targeted experiments:
+
+  powershell -ExecutionPolicy Bypass -File Assets\Plugins\Android\STTBridge.androidlib\download_tr_core_news_md.ps1 -IncludeDistInfo
+
+Local source check
+------------------
+Run:
+
+  powershell -ExecutionPolicy Bypass -File Assets\Plugins\Android\STTBridge.androidlib\check_python_sources.ps1
+
+This checks command_parser.py syntax with local Python 3.10 if available, checks
+that tr_core_news_md exists, and warns if dist-info is present. It intentionally
+does not import spaCy locally because Windows import success is not Android
+Chaquopy runtime proof.
+
+Capturing the real Chaquopy stderr
+----------------------------------
+After Unity has generated/failing PRAM Gradle files once, run:
+
+  powershell -ExecutionPolicy Bypass -File Assets\Plugins\Android\STTBridge.androidlib\run_chaquopy_debug_task.ps1
+
+The script reruns:
+
+  :unityLibrary:STTBridge.androidlib:extractDebugPythonBuildPackages --stacktrace --info --warning-mode all
+
+and writes the full output to:
+
+  Assets\Plugins\Android\STTBridge.androidlib\chaquopy_debug_build.log
+
+If the build still fails, inspect or send that log. It should contain the real
+Python/pip/Chaquopy stderr which Unity's PRAM log hides.
+
+Runtime expectations
+--------------------
+The parser must report structured ok:false JSON with error, traceback, and
+spacy_version if the real model cannot load. It must not silently fall back to
+spacy.blank("tr").
+
+tr_core_news_trf is intentionally not used for now because it is much heavier
+and transformer-based.
+
+Manual Android smoke tests after a successful build
+---------------------------------------------------
+Call:
+
+  await SpacyNlpAndroidBridgeClient.AnalyzeAsync("Dun ben de gittim.");
+  await SpacyNlpAndroidBridgeClient.AnalyzeAsync("Kirmizi arti isaretinin yanina git.");
+
+With Turkish characters, the intended inputs are:
+
+  "Dun ben de gittim." with Turkish u-umlaut
+  "Kirmizi arti isaretinin yanina git." with Turkish dotless-i and s-cedilla
+
+Expected Android result when the real model loads:
+
+  ok: true
+  engine: "real_spacy"
+  model: "tr_core_news_md"
+  tokens include lemma, POS, TAG, DEP, morph, and head fields
+
+For the drone-like command, drone_command should resolve close to:
+
+  action: "go_to"
+  color: "red"
+  target: "plus_sign"
+  spatial_relation: "side_or_near"

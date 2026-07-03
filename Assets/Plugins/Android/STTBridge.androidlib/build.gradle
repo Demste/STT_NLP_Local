@@ -1,6 +1,16 @@
-plugins {
-    id 'com.android.library'
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url "https://chaquo.com/maven" }
+    }
+    dependencies {
+        classpath "com.chaquo.python:gradle:17.0.0"
+    }
 }
+
+apply plugin: 'com.android.library'
+apply plugin: 'com.chaquo.python'
 
 android {
     namespace 'com.mehmet.sttbridge'
@@ -10,6 +20,29 @@ android {
         minSdk 24
         targetSdk 35
         consumerProguardFiles 'consumer-rules.pro'
+
+        ndk {
+            // Whisper/STT + Chaquopy Python runtime için gerçek cihaz hedefi.
+            abiFilters 'arm64-v8a'
+        }
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.10"
+
+        def windowsPython310 = file("C:/Users/3mehm/AppData/Local/Programs/Python/Python310/python.exe")
+        if (windowsPython310.exists()) {
+            buildPython windowsPython310.absolutePath
+        }
+
+        pip {
+            // spaCy import ederken runtime'da click istiyor.
+            // pydantic'i şimdilik elle pinlemiyoruz; gerekirse bir sonraki hataya göre ekleyeceğiz.
+            install "click==8.1.8"
+            install "spacy==3.8.7"
+        }
     }
 }
 
