@@ -26,20 +26,135 @@ android {
             abiFilters 'arm64-v8a'
         }
     }
+
+    // GGUF files must remain uncompressed so Android asset size checks and
+    // extraction for llama.cpp are predictable.
+    aaptOptions {
+        noCompress "gguf"
+    }
+}
+
+def isExecutableFile = { Object pathValue ->
+    if (pathValue == null) return false
+
+    def candidate = file(pathValue.toString())
+    return candidate.exists() && candidate.isFile() && candidate.canExecute()
+}
+
+def pythonVersionOutput = { String pythonPath ->
+    def output = new ByteArrayOutputStream()
+    def error = new ByteArrayOutputStream()
+
+    try {
+        exec {
+            commandLine pythonPath, "--version"
+            standardOutput = output
+            errorOutput = error
+            ignoreExitValue = true
+        }
+    } catch (Throwable ignored) {
+        return ""
+    }
+
+    return (output.toString("UTF-8") + error.toString("UTF-8")).trim()
+}
+
+def isPython310 = { Object pathValue ->
+    if (!isExecutableFile(pathValue)) return false
+
+    def candidate = file(pathValue.toString())
+    def versionText = pythonVersionOutput(candidate.absolutePath)
+    if (versionText.contains("Python 3.10")) {
+        logger.lifecycle("[Chaquopy] Python 3.10 candidate accepted: ${candidate.absolutePath} (${versionText})")
+        return true
+    }
+
+    logger.lifecycle("[Chaquopy] Python candidate skipped: ${candidate.absolutePath} (${versionText ?: "version unavailable"})")
+    return false
+}
+
+def addIfExecutable = { List<File> candidates, Object pathValue ->
+    if (isExecutableFile(pathValue)) {
+        candidates.add(file(pathValue.toString()))
+    }
+}
+
+def addPythonExecutablesInDirectory = { List<File> candidates, File parentDir ->
+    if (parentDir == null || !parentDir.exists() || !parentDir.isDirectory()) return
+
+    parentDir.listFiles()?.each { File child ->
+        File python = new File(child, "bin/python")
+        if (isExecutableFile(python)) {
+            candidates.add(python)
+        }
+    }
+}
+
+def findPython310 = {
+    def candidates = []
+    def homeDir = System.getProperty("user.home")
+
+    addIfExecutable(candidates, project.findProperty("chaquopy.buildPython"))
+    addIfExecutable(candidates, System.getenv("CHAQUOPY_BUILD_PYTHON"))
+    addIfExecutable(candidates, System.getenv("PYTHON310"))
+
+    // Keep existing Windows support.
+    addIfExecutable(candidates, "C:/Users/3mehm/AppData/Local/Programs/Python/Python310/python.exe")
+
+    // Common macOS Homebrew locations. Unity Hub often launches Gradle with a
+    // restricted PATH, so never rely on PATH discovery alone.
+    addIfExecutable(candidates, "/opt/homebrew/bin/python3.10")
+    addIfExecutable(candidates, "/usr/local/bin/python3.10")
+
+    if (homeDir != null && !homeDir.trim().isEmpty()) {
+        addIfExecutable(candidates, "${homeDir}/.pyenv/shims/python3.10")
+
+        File pyenvVersions = file("${homeDir}/.pyenv/versions")
+        if (pyenvVersions.exists() && pyenvVersions.isDirectory()) {
+            pyenvVersions.listFiles()?.findAll { File dir ->
+                dir.isDirectory() && dir.name.startsWith("3.10.")
+            }?.sort { it.name }?.each { File versionDir ->
+                addIfExecutable(candidates, new File(versionDir, "bin/python"))
+            }
+        }
+
+        addPythonExecutablesInDirectory(candidates, file("${homeDir}/miniforge3/envs"))
+        addPythonExecutablesInDirectory(candidates, file("${homeDir}/anaconda3/envs"))
+        addPythonExecutablesInDirectory(candidates, file("${homeDir}/miniconda3/envs"))
+    }
+
+    def uniqueCandidates = []
+    def seen = [] as Set
+    candidates.each { File candidate ->
+        def key = candidate.absolutePath
+        if (!seen.contains(key)) {
+            uniqueCandidates.add(candidate)
+            seen.add(key)
+        }
+    }
+
+    return uniqueCandidates.find { File candidate -> isPython310(candidate) }
 }
 
 chaquopy {
     defaultConfig {
         version = "3.10"
 
-        def windowsPython310 = file("C:/Users/3mehm/AppData/Local/Programs/Python/Python310/python.exe")
-        if (windowsPython310.exists()) {
-            buildPython windowsPython310.absolutePath
+        def selectedPython310 = findPython310()
+        if (selectedPython310 == null) {
+            throw new GradleException(
+                    "Chaquopy requires an explicit Python 3.10 executable, but none was found. " +
+                    "Install Python 3.10, pass -Pchaquopy.buildPython=/absolute/path/to/python3.10, " +
+                    "or set CHAQUOPY_BUILD_PYTHON=/absolute/path/to/python3.10. " +
+                    "Unity Hub on macOS may launch Gradle with PATH=/usr/bin:/bin:/usr/sbin:/sbin, " +
+                    "so do not rely on PATH-only Python discovery.")
         }
+
+        logger.lifecycle("[Chaquopy] Using buildPython: ${selectedPython310.absolutePath}")
+        buildPython selectedPython310.absolutePath
 
         pip {
             // spaCy import ederken runtime'da click istiyor.
-            // pydantic'i şimdilik elle pinlemiyoruz; gerekirse bir sonraki hataya göre ekleyeceğiz.
             install "click==8.1.8"
             install "spacy==3.8.7"
         }

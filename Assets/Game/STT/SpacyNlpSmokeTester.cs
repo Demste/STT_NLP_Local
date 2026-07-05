@@ -6,13 +6,18 @@ namespace Game.STT
 {
     public sealed class SpacyNlpSmokeTester : MonoBehaviour
     {
-        [SerializeField] private bool runOnStart = true;
+        [SerializeField] private bool runOnStart = false;
 
         private async void Start()
         {
             if (!runOnStart)
                 return;
 
+            await RunSmokeTestsAsync(GetDestroyToken());
+        }
+
+        public async void RunSmokeTests()
+        {
             await RunSmokeTestsAsync(GetDestroyToken());
         }
 

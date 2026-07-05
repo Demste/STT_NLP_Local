@@ -105,3 +105,16 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# macOS
+.DS_Store
+# Local native build outputs - do not commit
+/Tools/llama-command-android/build/
+/Tools/llama-command-android/.cxx/
+/Tools/llama-command-android/**/CMakeFiles/
+/Tools/llama-command-android/**/CMakeCache.txt
+/Tools/llama-command-android/**/cmake_install.cmake
+/Tools/llama-command-android/**/Makefile
+
+# Local third-party checkout - keep locally, do not commit
+/Tools/third_party/

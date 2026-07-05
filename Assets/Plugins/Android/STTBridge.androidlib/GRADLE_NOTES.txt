@@ -1,6 +1,37 @@
 spaCy / Chaquopy NLP bridge notes
 =================================
 
+Python 3.10 for Chaquopy
+------------------------
+Chaquopy is configured with:
+
+  version = "3.10"
+
+The Gradle build must run with a real Python 3.10 executable available through
+Chaquopy's buildPython setting. Unity Hub on macOS may launch Gradle with a
+restricted PATH:
+
+  /usr/bin:/bin:/usr/sbin:/sbin
+
+So terminal-only Python, conda, pyenv, or Homebrew discovery may not be visible
+unless the path is explicit.
+
+Preferred options:
+
+  - Gradle property:
+      chaquopy.buildPython=/absolute/path/to/python3.10
+
+  - Environment variable:
+      CHAQUOPY_BUILD_PYTHON=/absolute/path/to/python3.10
+
+Common Homebrew path on Apple Silicon:
+
+  /opt/homebrew/bin/python3.10
+
+If Python 3.10 is missing on macOS with Homebrew:
+
+  brew install python@3.10
+
 Current build failure being diagnosed
 -------------------------------------
 Unity Android deploy/build currently fails before Java runtime:
