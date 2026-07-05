@@ -149,3 +149,6 @@ Packages/packages-lock.json linguist-generated
 # Exceptions for .asset files such as lightning pre-baking
 LightingData.asset     binary
 Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/whisper/ggml-small.bin filter=lfs diff=lfs merge=lfs -text
+Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/llm/*.gguf filter=lfs diff=lfs merge=lfs -text
+Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/llm/*.bin filter=lfs diff=lfs merge=lfs -text
+Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/llm/*.safetensors filter=lfs diff=lfs merge=lfs -text
