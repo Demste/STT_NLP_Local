@@ -26,18 +26,25 @@ namespace Game.NLP
 
         public async Task<SpeechCommandPipelineResult> ProcessTranscriptAsync(
             string transcript,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string requestId = "")
         {
             string configJson = ActiveConfigJson;
+            string safeTranscript = transcript ?? string.Empty;
+            string logRequestId = string.IsNullOrWhiteSpace(requestId) ? "-" : requestId;
+
+            Debug.Log($"[NLP] request_id={logRequestId} pipeline_input={safeTranscript}");
+            Debug.Log($"[NLP] request_id={logRequestId} spacy_input={safeTranscript}");
 
             string nlpJson = await Android.SpacyNlpAndroidBridgeClient.AnalyzeAsync(
-                transcript,
+                safeTranscript,
                 configJson,
                 cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
 
+            Debug.Log($"[NLP] request_id={logRequestId} llm_input={safeTranscript}");
             string llmJson = await Android.OfflineLlmAndroidBridgeClient.ParseCommandAsync(
-                transcript,
+                safeTranscript,
                 nlpJson,
                 configJson,
                 cancellationToken);
@@ -45,7 +52,7 @@ namespace Game.NLP
 
             SpeechCommandPipelineResult result = new SpeechCommandPipelineResult
             {
-                transcript = transcript ?? string.Empty,
+                transcript = safeTranscript,
                 configJson = configJson,
                 activeLlmConfigJson = ActiveLlmConfigJson,
                 activeLlmConfigSummary = ActiveLlmConfigSummary,
@@ -71,6 +78,7 @@ namespace Game.NLP
                 result.validated.inference_ran = result.validated.inference_ran || result.llm.inference_ran;
             }
 
+            Debug.Log($"[NLP] request_id={logRequestId} validated_command={ToJsonForLog(result.validated)}");
             Completed?.Invoke(result);
             return result;
         }
@@ -91,6 +99,11 @@ namespace Game.NLP
                 Debug.LogWarning("[SpeechCommandPipeline] JSON parse failed for " + typeof(T).Name + ": " + ex.Message);
                 return null;
             }
+        }
+
+        private static string ToJsonForLog(ValidatedCommandResult command)
+        {
+            return command != null ? JsonUtility.ToJson(command) : "null";
         }
     }
 

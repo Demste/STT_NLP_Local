@@ -13,7 +13,7 @@ namespace Game.NLP.Editor
         private const string MenuPath = "Tools/NLP/Create Speech Command Debug Panel";
         private const string RootName = "NLP_Command_Debug_Root";
         private const string PipelineName = "SpeechCommandPipeline";
-        private const string TestPhrase = "Mavi helikopterin üstüne çık.";
+        private const string TestPhrase = "ileri git";
 
         [MenuItem(MenuPath)]
         public static void CreateSpeechCommandDebugPanel()

@@ -18,12 +18,7 @@ import android.util.Log;
 import androidx.core.content.FileProvider;
 
 import org.json.JSONObject;
-import org.vosk.Model;
-import org.vosk.Recognizer;
-
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -33,22 +28,16 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
 public final class STTBridge {
     private static final String TAG = "STTBridge";
 
-    private static final String PROVIDER_VOSK = "vosk_tr_offline";
     private static final String PROVIDER_WHISPER = "whisper_cpp_offline";
-    private static final String PROVIDER_ELEVENLABS = "elevenlabs_scribe_v2";
 
-    private static final String VOSK_MODEL_ASSET_DIR = "vosk-model-small-tr-0.3";
     private static final String WHISPER_ASSET_DIR = "whisper";
 
-    private static Model voskModel;
     private static boolean whisperLoadTried;
     private static boolean whisperNativeLoaded;
 
@@ -294,7 +283,6 @@ public final class STTBridge {
             final String provider,
             final String wavPath,
             final String language,
-            final String elevenLabsApiKey,
             final String unityGameObject,
             final String unityCallbackMethod) {
 
@@ -304,12 +292,8 @@ public final class STTBridge {
             String error = "";
 
             try {
-                if (PROVIDER_VOSK.equals(provider)) {
-                    text = transcribeVosk(wavPath);
-                } else if (PROVIDER_WHISPER.equals(provider)) {
+                if (PROVIDER_WHISPER.equals(provider)) {
                     text = transcribeWhisper(wavPath, normalizeLanguage(language));
-                } else if (PROVIDER_ELEVENLABS.equals(provider)) {
-                    text = transcribeElevenLabs(wavPath, normalizeLanguage(language), elevenLabsApiKey);
                 } else {
                     throw new IllegalArgumentException("Bilinmeyen provider: " + provider);
                 }
@@ -322,54 +306,6 @@ public final class STTBridge {
             String json = buildResultJson(provider, normalizeLanguage(language), text, durationMs, wavPath, error);
             sendUnityMessage(unityGameObject, unityCallbackMethod, json);
         }, "stt-bridge-thread").start();
-    }
-
-    private static String transcribeVosk(String wavPath) throws Exception {
-        Context context = getUnityAppContextOrThrow();
-        File modelDir = copyAssetDirectoryToFiles(context, VOSK_MODEL_ASSET_DIR, "stt_models/" + VOSK_MODEL_ASSET_DIR);
-
-        File finalMdl = new File(modelDir, "final.mdl");
-        File hclrFst = new File(modelDir, "HCLr.fst");
-        File grFst = new File(modelDir, "Gr.fst");
-
-        if (!finalMdl.exists() || !hclrFst.exists() || !grFst.exists()) {
-            throw new IllegalStateException(
-                    "Vosk modeli eksik veya yanlış klasörde. Beklenen dosyalar: final.mdl, HCLr.fst, Gr.fst. " +
-                    "Model içeriği assets/" + VOSK_MODEL_ASSET_DIR + " altında direkt durmalı."
-            );
-        }
-
-        if (voskModel == null) {
-            voskModel = new Model(modelDir.getAbsolutePath());
-        }
-
-        WavInfo wavInfo = WavInfo.read(wavPath);
-        Recognizer recognizer = new Recognizer(voskModel, wavInfo.sampleRate);
-        FileInputStream fis = null;
-
-        try {
-            fis = new FileInputStream(wavPath);
-            long skipped = fis.skip(wavInfo.dataOffset);
-
-            while (skipped < wavInfo.dataOffset) {
-                long more = fis.skip(wavInfo.dataOffset - skipped);
-                if (more <= 0) break;
-                skipped += more;
-            }
-
-            byte[] buffer = new byte[4096];
-            int read;
-
-            while ((read = fis.read(buffer)) > 0) {
-                recognizer.acceptWaveForm(buffer, read);
-            }
-
-            String json = recognizer.getFinalResult();
-            return extractText(json);
-        } finally {
-            try { recognizer.close(); } catch (Throwable ignored) {}
-            if (fis != null) try { fis.close(); } catch (IOException ignored) {}
-        }
     }
 
     private static String transcribeWhisper(String wavPath, String language) throws Exception {
@@ -391,43 +327,6 @@ public final class STTBridge {
         }
 
         return whisperTranscribeNative(modelFile.getAbsolutePath(), wavPath, language);
-    }
-
-    private static String transcribeElevenLabs(String wavPath, String language, String apiKey) throws Exception {
-        if (apiKey == null || apiKey.trim().isEmpty()) {
-            throw new IllegalStateException("ElevenLabs API key eksik. Unity Inspector veya UI input üzerinden ver.");
-        }
-
-        String boundary = "----UnitySTTBoundary" + System.currentTimeMillis();
-        URL url = new URL("https://api.elevenlabs.io/v1/speech-to-text");
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-
-        connection.setConnectTimeout(30000);
-        connection.setReadTimeout(120000);
-        connection.setDoOutput(true);
-        connection.setRequestMethod("POST");
-        connection.setRequestProperty("xi-api-key", apiKey.trim());
-        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-
-        OutputStream output = new BufferedOutputStream(connection.getOutputStream());
-        writeFormField(output, boundary, "model_id", "scribe_v2");
-        writeFormField(output, boundary, "language_code", language);
-        writeFormField(output, boundary, "tag_audio_events", "false");
-        writeFormField(output, boundary, "diarize", "false");
-        writeFileField(output, boundary, "file", "audio.wav", "audio/wav", new File(wavPath));
-        output.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
-        output.flush();
-        output.close();
-
-        int code = connection.getResponseCode();
-        InputStream input = code >= 200 && code < 300 ? connection.getInputStream() : connection.getErrorStream();
-        String response = readAll(input);
-
-        if (code < 200 || code >= 300) {
-            throw new IOException("ElevenLabs HTTP " + code + ": " + response);
-        }
-
-        return extractText(response);
     }
 
     private static void ensureWhisperNativeLoaded() {
@@ -515,65 +414,6 @@ public final class STTBridge {
         }
     }
 
-    private static File copyAssetDirectoryToFiles(Context context, String assetDir, String outputRelativeDir) throws IOException {
-        File outputDir = new File(context.getFilesDir(), outputRelativeDir);
-
-        if (!outputDir.exists() && !outputDir.mkdirs()) {
-            throw new IOException("Model klasörü oluşturulamadı: " + outputDir);
-        }
-
-        copyAssetDirectoryRecursive(context.getAssets(), assetDir, outputDir);
-        return outputDir;
-    }
-
-    private static void copyAssetDirectoryRecursive(AssetManager assets, String assetPath, File outputDir) throws IOException {
-        String[] children = assets.list(assetPath);
-
-        if (children == null || children.length == 0) {
-            copyAssetFile(assets, assetPath, outputDir);
-            return;
-        }
-
-        if (!outputDir.exists() && !outputDir.mkdirs()) {
-            throw new IOException("Klasör oluşturulamadı: " + outputDir);
-        }
-
-        for (String child : children) {
-            String childAssetPath = assetPath + "/" + child;
-            File childOutput = new File(outputDir, child);
-            String[] nested = assets.list(childAssetPath);
-
-            if (nested != null && nested.length > 0) {
-                copyAssetDirectoryRecursive(assets, childAssetPath, childOutput);
-            } else {
-                copyAssetFile(assets, childAssetPath, outputDir);
-            }
-        }
-    }
-
-    private static void copyAssetFile(AssetManager assets, String assetFilePath, File outputDir) throws IOException {
-        File outputFile = new File(outputDir, new File(assetFilePath).getName());
-
-        if (outputFile.exists() && outputFile.length() > 0) return;
-
-        InputStream input = assets.open(assetFilePath);
-        OutputStream output = new FileOutputStream(outputFile);
-
-        try {
-            byte[] buffer = new byte[8192];
-            int read;
-
-            while ((read = input.read(buffer)) > 0) {
-                output.write(buffer, 0, read);
-            }
-
-            output.flush();
-        } finally {
-            try { output.close(); } catch (IOException ignored) {}
-            try { input.close(); } catch (IOException ignored) {}
-        }
-    }
-
     private static File copyFirstExistingAssetFile(Context context, String[] assetFilePaths, String outputRelativeDir) throws IOException {
         AssetManager assets = context.getAssets();
         File outputDir = new File(context.getFilesDir(), outputRelativeDir);
@@ -615,52 +455,6 @@ public final class STTBridge {
         }
 
         return null;
-    }
-
-    private static void writeFormField(OutputStream output, String boundary, String name, String value) throws IOException {
-        output.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
-        output.write(("Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-        output.write(((value != null ? value : "") + "\r\n").getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static void writeFileField(OutputStream output, String boundary, String name, String filename, String contentType, File file) throws IOException {
-        output.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
-        output.write(("Content-Disposition: form-data; name=\"" + name + "\"; filename=\"" + filename + "\"\r\n").getBytes(StandardCharsets.UTF_8));
-        output.write(("Content-Type: " + contentType + "\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-
-        InputStream input = new BufferedInputStream(new FileInputStream(file));
-
-        try {
-            byte[] buffer = new byte[8192];
-            int read;
-
-            while ((read = input.read(buffer)) > 0) {
-                output.write(buffer, 0, read);
-            }
-        } finally {
-            try { input.close(); } catch (IOException ignored) {}
-        }
-
-        output.write("\r\n".getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String readAll(InputStream input) throws IOException {
-        if (input == null) return "";
-
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int read;
-
-        while ((read = input.read(buffer)) > 0) {
-            output.write(buffer, 0, read);
-        }
-
-        return output.toString("UTF-8");
-    }
-
-    private static String extractText(String json) throws Exception {
-        JSONObject object = new JSONObject(json);
-        return object.optString("text", "");
     }
 
     private static String normalizeLanguage(String language) {

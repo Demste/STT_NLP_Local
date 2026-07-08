@@ -169,6 +169,5 @@ rootProject.subprojects {
 }
 
 dependencies {
-    implementation 'com.alphacephei:vosk-android:0.3.75'
     implementation 'androidx.core:core:1.12.0'
 }

@@ -80,6 +80,15 @@ public final class OfflineLlmBridge {
             }
 
             JSONObject config = LlmCommandSchema.mergeWithDefault(configJson);
+            String safeRawText = rawText != null ? rawText.trim() : "";
+            if (safeRawText.isEmpty()) {
+                return buildUnknownCommandJson(
+                        rawText,
+                        config,
+                        "empty_or_unclear_command",
+                        System.currentTimeMillis() - started);
+            }
+
             OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
             LlmBackendStatus backendStatus = engine.getStatus();
 
@@ -91,7 +100,7 @@ public final class OfflineLlmBridge {
             }
 
             JSONObject llmCommand;
-            String prompt = LlmPromptBuilder.build(rawText, spacyAnalysisJson, config);
+            String prompt = LlmPromptBuilder.build(safeRawText, spacyAnalysisJson, config);
             String llmRaw = "";
             LlmGenerationOptions options = LlmGenerationOptions.fromConfig(config);
 
@@ -177,7 +186,7 @@ public final class OfflineLlmBridge {
             payload.put("initialized", true);
             payload.put("inference_ran", true);
             payload.put("backend_status", engine.getStatus().toJson());
-            payload.put("input", rawText != null ? rawText : "");
+            payload.put("input", safeRawText);
             payload.put("llm_raw", llmRaw);
             payload.put("llm_command", llmCommand);
             payload.put("json_repair_applied", repairResult.applied);
@@ -189,6 +198,43 @@ public final class OfflineLlmBridge {
         } catch (Throwable t) {
             Log.e(TAG, "Offline LLM bridge failed.", t);
             return buildErrorJson(rawText, "offline_llm_bridge_failed", t, System.currentTimeMillis() - started);
+        }
+    }
+
+    private static String buildUnknownCommandJson(String rawText, JSONObject config, String reason, long durationMs) {
+        try {
+            String unknownAction = config != null ? config.optString("unknown_action", "unknown") : "unknown";
+            JSONObject command = new JSONObject();
+            command.put("action", unknownAction);
+            command.put("target", "");
+            command.put("confidence", 0.0);
+            command.put("requires_clarification", true);
+            command.put("reason", reason != null ? reason : "command is empty or unclear");
+            command.put("source", ENGINE_NAME);
+
+            JSONObject validated = validate(command, config != null ? config : LlmCommandSchema.defaultConfig());
+            validated.put("stage", "input_rejected");
+            validated.put("inference_ran", false);
+
+            JSONObject payload = new JSONObject();
+            payload.put("ok", false);
+            payload.put("engine", ENGINE_NAME);
+            payload.put("backend", JSONObject.NULL);
+            payload.put("stage", "input_rejected");
+            payload.put("initialized", false);
+            payload.put("inference_ran", false);
+            payload.put("backend_status", JSONObject.NULL);
+            payload.put("input", rawText != null ? rawText : "");
+            payload.put("llm_raw", "");
+            payload.put("llm_command", command);
+            payload.put("json_repair_applied", false);
+            payload.put("json_repair_notes", new JSONArray());
+            payload.put("normalized_command", command);
+            payload.put("validated_command", validated);
+            payload.put("durationMs", durationMs);
+            return payload.toString();
+        } catch (Throwable t) {
+            return buildErrorJson(rawText, "input_rejected", t, durationMs);
         }
     }
 

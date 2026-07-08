@@ -13,6 +13,8 @@ public final class LlmPromptBuilder {
         String system =
                 "You are an offline Turkish game command parser. "
                         + "Return exactly one valid compact JSON object. No markdown. "
+                        + "Only parse the given USER_COMMAND. Do not use examples, previous commands, scene objects, or default targets as output. "
+                        + "If USER_COMMAND is empty or unclear, return action unknown, empty target, confidence 0, and a short reason. "
                         + "Map Turkish commands to allowed actions. "
                         + "Keep target open vocabulary. Do not reject objects because they are not in the scene. "
                         + "Allowed actions: " + allowedActions + ". "
@@ -22,10 +24,10 @@ public final class LlmPromptBuilder {
                         + "action must be one of the allowed actions. "
                         + "target is open vocabulary and must preserve the color plus object phrase. "
                         + "For Turkish phrases like üzerine çık or üstüne çık, action must be move_above. "
-                        + "Schema: {\"action\":\"move_above\",\"target\":\"mavi araba\",\"confidence\":0.9,\"reason\":\"...\"}";
+                        + "Schema only: {\"action\":\"unknown\",\"target\":\"\",\"confidence\":0,\"reason\":\"...\"}";
 
         String user =
-                "Text: " + safe(rawText) + "\n"
+                "USER_COMMAND: " + safe(rawText) + "\n"
                         + "Compact NLP hints:\n"
                         + "root: " + hints.optString("root", "") + "\n"
                         + "candidate_action: " + hints.optString("candidate_action", "") + "\n"

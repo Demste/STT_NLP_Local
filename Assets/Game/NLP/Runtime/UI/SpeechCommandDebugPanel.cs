@@ -41,16 +41,19 @@ namespace Game.NLP
 
         private void Awake()
         {
-            if (parseButton != null)
-            {
-                parseButton.onClick.AddListener(ParseCurrentText);
-            }
-
             ApplyMobileReadableTextSettings();
             EnsureRawJsonLayoutRefs();
         }
 
-        private void OnDestroy()
+        private void OnEnable()
+        {
+            if (parseButton != null)
+            {
+                parseButton.onClick.AddListener(ParseCurrentText);
+            }
+        }
+
+        private void OnDisable()
         {
             if (parseButton != null)
             {
@@ -58,11 +61,23 @@ namespace Game.NLP
             }
 
             cancellation?.Cancel();
+            SetBusy(false);
+        }
+
+        private void OnDestroy()
+        {
+            cancellation?.Cancel();
             cancellation?.Dispose();
         }
 
         public async void ParseCurrentText()
         {
+            if (!isActiveAndEnabled)
+            {
+                Debug.Log("[SpeechCommandDebugPanel] ParseCurrentText ignored because panel is disabled.");
+                return;
+            }
+
             if (busy)
             {
                 return;
@@ -133,6 +148,12 @@ namespace Game.NLP
                 transcriptInput.text = transcript ?? string.Empty;
             }
 
+            if (!isActiveAndEnabled)
+            {
+                Debug.Log("[SpeechCommandDebugPanel] ProcessTranscriptFromExternal ignored because panel is disabled.");
+                return;
+            }
+
             ParseCurrentText();
         }
 
@@ -153,7 +174,7 @@ namespace Game.NLP
             }
 
             parseButton = button;
-            if (Application.isPlaying && parseButton != null)
+            if (Application.isPlaying && isActiveAndEnabled && parseButton != null)
             {
                 parseButton.onClick.AddListener(ParseCurrentText);
             }

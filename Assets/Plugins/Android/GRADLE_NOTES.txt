@@ -1,4 +1,5 @@
-If Unity Gradle cannot resolve com.alphacephei:vosk-android:0.3.75, enable Custom Main Gradle Template and make sure repositories include:
+STTBridge.androidlib uses AndroidX, Chaquopy NLP, Whisper.cpp, and offline LLM native libraries.
+If Unity Gradle cannot resolve AndroidX/Chaquopy artifacts, enable Custom Main Gradle Template and make sure repositories include:
 
 google()
 mavenCentral()

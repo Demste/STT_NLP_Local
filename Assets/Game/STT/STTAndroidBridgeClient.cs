@@ -10,7 +10,6 @@ namespace Game.STT
             STTProvider provider,
             string wavPath,
             string language,
-            string elevenLabsApiKey,
             string unityGameObjectName,
             string unityCallbackMethod)
         {
@@ -21,7 +20,6 @@ namespace Game.STT
                 provider.ToApiValue(),
                 wavPath,
                 language,
-                elevenLabsApiKey ?? string.Empty,
                 unityGameObjectName,
                 unityCallbackMethod
             );

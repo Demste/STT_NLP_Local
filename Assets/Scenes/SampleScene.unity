@@ -3012,16 +3012,18 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Game.STT.STTTestController
   language: tr
-  elevenLabsApiKeyForLocalTest: 
-  elevenLabsApiKeyInput: {fileID: 0}
   sampleRate: 16000
   maxRecordSeconds: 30
-  providerDropdown: {fileID: 785367724}
+  recordingTailSeconds: 0.35
+  speechCommandPipeline: {fileID: 0}
+  recordButton: {fileID: 609808018}
   shareTxtButton: {fileID: 455354796}
   statusText: {fileID: 1340156508}
   transcriptText: {fileID: 64488532}
-  resultsText: {fileID: 871425299}
+  nlpJsonResultText: {fileID: 871425299}
+  timingText: {fileID: 0}
   filePathText: {fileID: 1582393956}
+  providerDropdown: {fileID: 785367724}
 --- !u!4 &2059413976
 Transform:
   m_ObjectHideFlags: 0
