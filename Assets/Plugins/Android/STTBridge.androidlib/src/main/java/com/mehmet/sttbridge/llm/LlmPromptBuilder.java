@@ -1,170 +1,74 @@
 package com.mehmet.sttbridge.llm;
 
-import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.nio.charset.StandardCharsets;
+
+/** Builds bounded action-only and object-only classification prompts. */
 public final class LlmPromptBuilder {
+    private static final String ACTION_SYSTEM =
+            "Türkçe drone komutunun niyetini sınıflandır. Yalnız kullanıcı metnindeki kanıtı kullan; slot uydurma. "
+            + "FIND_OBJECT=belirtilen fiziksel nesneyi arama veya tespit; TRACK_OBJECT=belirtilen nesneyi sürekli takip; "
+            + "HOLD_OVER_OBJECT=belirtilen nesnenin üzerinde konumu koruma; OBSERVE_CURRENT=mevcut konumdan çevreyi gözlemleme; "
+            + "HOVER=havada sabit kalma; STOP=mevcut hareketi durdurma; LAND_HOME=başlangıç/eve iniş; "
+            + "LAND_CURRENT=mevcut yere iniş; LAND_AT_WAIT_POINT=bekleme noktasına iniş; MOVE_VERTICAL=dikey mesafeli hareket; "
+            + "MOVE_DIRECTION=yatay yön ve mesafe hareketi. Diğer izinliler TAKE_OFF,SET_SPEED,TURN,GO_TO_LOCATION,FIND_MARKER. "
+            + "Niyet yoksa UNKNOWN. Yalnız {\"action\":\"ACTION\"} biçiminde tek JSON nesnesi yaz.";
+
+    private static final String OBJECT_SYSTEM =
+            "Türkçe komutta açıkça söylenen fiziksel nesneyi sınıflandır. Yalnız verilen whitelist içinden seç. "
+            + "Nesne söylenmediyse veya eşleşmiyorsa NONE seç. evidence kullanıcı komutundaki kısa ve aynen bulunan ifade olmalı. "
+            + "Yalnız {\"object\":\"VALUE\",\"evidence\":\"metin\"} biçiminde tek JSON nesnesi yaz.";
+
     private LlmPromptBuilder() {}
 
     public static String build(String rawText, String spacyAnalysisJson, JSONObject config) {
-        JSONObject hints = compactHints(spacyAnalysisJson);
-        String allowedActions = allowedActions(config);
+        return buildActionClassificationPrompt(rawText, spacyAnalysisJson, config);
+    }
 
-        String system =
-                "You are an offline Turkish game command parser. "
-                        + "Return exactly one valid compact JSON object. No markdown. "
-                        + "Only parse the given USER_COMMAND. Do not use examples, previous commands, scene objects, or default targets as output. "
-                        + "If USER_COMMAND is empty or unclear, return action unknown, empty target, confidence 0, and a short reason. "
-                        + "Map Turkish commands to allowed actions. "
-                        + "Keep target open vocabulary. Do not reject objects because they are not in the scene. "
-                        + "Allowed actions: " + allowedActions + ". "
-                        + "Use unknown only when no allowed action fits. "
-                        + "Use these exact keys only: action, target, confidence, reason. "
-                        + "No nested objects. No arrays. No parentheses. Keep reason short. "
-                        + "action must be one of the allowed actions. "
-                        + "target is open vocabulary and must preserve the color plus object phrase. "
-                        + "For Turkish phrases like üzerine çık or üstüne çık, action must be move_above. "
-                        + "Schema only: {\"action\":\"unknown\",\"target\":\"\",\"confidence\":0,\"reason\":\"...\"}";
+    public static String buildActionClassificationPrompt(String analysisInput, String spacyAnalysisJson, JSONObject config) {
+        return chat(ACTION_SYSTEM, analysisInput, compactEvidence(spacyAnalysisJson));
+    }
 
-        String user =
-                "USER_COMMAND: " + safe(rawText) + "\n"
-                        + "Compact NLP hints:\n"
-                        + "root: " + hints.optString("root", "") + "\n"
-                        + "candidate_action: " + hints.optString("candidate_action", "") + "\n"
-                        + "candidate_target: " + hints.optString("candidate_target", "") + "\n"
-                        + "spatial_relation: " + hints.optString("spatial_relation", "") + "\n"
-                        + "lemmas: " + hints.optString("lemmas", "");
-
-        return "<|im_start|>system\n"
-                + system
-                + "\n<|im_end|>\n"
-                + "<|im_start|>user\n"
-                + user
-                + "\n<|im_end|>\n"
-                + "<|im_start|>assistant\n";
+    public static String buildObjectClassificationPrompt(String analysisInput, String detectedPhrase, String spacyAnalysisJson, JSONObject config) {
+        String evidence = compactEvidence(spacyAnalysisJson);
+        String user = "ALLOWED_OBJECTS=" + LlmCommandSchema.objectCsv() + ",NONE\n"
+                + "DETECTED_OBJECT_PHRASE=" + safe(detectedPhrase) + "\n" + evidence;
+        return chat(OBJECT_SYSTEM, analysisInput, user);
     }
 
     public static String buildSmokePrompt() {
-        return "<|im_start|>system\n"
-                + "Return only JSON.\n"
-                + "<|im_end|>\n"
-                + "<|im_start|>user\n"
-                + "Return {\"ok\":true}\n"
-                + "<|im_end|>\n"
-                + "<|im_start|>assistant\n";
+        return build("15 metre yüksel", "{}", null);
     }
 
-    private static JSONObject compactHints(String spacyAnalysisJson) {
-        JSONObject hints = new JSONObject();
+    /** Native JNI currently exposes no tokenizer count; this is marked as an estimate in diagnostics. */
+    public static int estimatePromptTokens(String prompt) {
+        int bytes = safe(prompt).getBytes(StandardCharsets.UTF_8).length;
+        return Math.max(1, (bytes + 3) / 4);
+    }
 
+    public static int estimateOutputTokens(String output) {
+        int bytes = safe(output).getBytes(StandardCharsets.UTF_8).length;
+        return Math.max(0, (bytes + 3) / 4);
+    }
+
+    static String classificationInstruction() { return ACTION_SYSTEM; }
+
+    private static String chat(String system, String command, String evidence) {
+        return "<|im_start|>system\n" + system + "\n<|im_end|>\n"
+                + "<|im_start|>user\nUSER_COMMAND_BEGIN\n" + safe(command)
+                + "\nUSER_COMMAND_END\n" + safe(evidence)
+                + "\n<|im_end|>\n<|im_start|>assistant\n";
+    }
+
+    private static String compactEvidence(String spacyAnalysisJson) {
         try {
-            JSONObject payload = new JSONObject(safe(spacyAnalysisJson));
-            JSONObject analysis = payload.optJSONObject("analysis");
-            JSONObject root = analysis != null ? analysis.optJSONObject("root") : payload.optJSONObject("root");
-            if (root != null) {
-                hints.put("root", firstNonEmpty(root.optString("lemma", ""), root.optString("text", "")));
-            }
-
-            JSONObject baseline = payload.optJSONObject("baseline_hints");
-            if (baseline != null) {
-                hints.put("candidate_action", baseline.optString("action_hint", ""));
-                hints.put("candidate_target", baseline.optString("target_hint", ""));
-                hints.put("spatial_relation", baseline.optString("spatial_relation_hint", ""));
-            }
-
-            if (!hints.has("candidate_target") || hints.optString("candidate_target", "").isEmpty()) {
-                JSONArray targets = analysis != null ? analysis.optJSONArray("target_candidates") : null;
-                JSONObject target = firstObject(targets);
-                if (target != null) {
-                    hints.put("candidate_target", firstNonEmpty(target.optString("lemma_text", ""), target.optString("text", "")));
-                }
-            }
-
-            if (!hints.has("candidate_action") || hints.optString("candidate_action", "").isEmpty()) {
-                JSONArray actions = analysis != null ? analysis.optJSONArray("action_candidates") : null;
-                JSONObject action = firstObject(actions);
-                if (action != null) {
-                    hints.put("candidate_action", firstNonEmpty(action.optString("lemma", ""), action.optString("text", "")));
-                }
-            }
-
-            hints.put("lemmas", compactLemmas(analysis != null ? analysis.optJSONArray("tokens") : payload.optJSONArray("tokens")));
+            JSONObject root = new JSONObject(safe(spacyAnalysisJson).trim().isEmpty() ? "{}" : spacyAnalysisJson);
+            JSONObject compact = root.optJSONObject("compact_evidence");
+            return compact != null ? "SPACY_COMPACT=" + compact.toString() : "SPACY_COMPACT={}";
         } catch (Throwable ignored) {
-            // Prompt construction must not fail just because debug NLP JSON had
-            // an unexpected shape. The raw text remains the source of truth.
+            return "SPACY_COMPACT={}";
         }
-
-        return hints;
     }
-
-    private static String compactLemmas(JSONArray tokens) {
-        if (tokens == null) {
-            return "";
-        }
-
-        StringBuilder builder = new StringBuilder();
-        int count = Math.min(tokens.length(), 16);
-        for (int i = 0; i < count; i++) {
-            JSONObject token = tokens.optJSONObject(i);
-            if (token == null) {
-                continue;
-            }
-
-            String lemma = firstNonEmpty(token.optString("lemma", ""), token.optString("text", ""));
-            if (lemma.isEmpty()) {
-                continue;
-            }
-
-            if (builder.length() > 0) {
-                builder.append(' ');
-            }
-            builder.append(lemma);
-        }
-
-        return builder.toString();
-    }
-
-    private static String allowedActions(JSONObject config) {
-        JSONArray actions = config != null ? config.optJSONArray("allowed_actions") : null;
-        if (actions == null || actions.length() == 0) {
-            return "move_to, move_above, move_below, follow, stop, pick_up, drop, look_at, rotate_to, unknown";
-        }
-
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < actions.length(); i++) {
-            Object action = actions.opt(i);
-            String id = "";
-            if (action instanceof JSONObject) {
-                id = ((JSONObject) action).optString("id", "");
-            } else if (action != null) {
-                id = String.valueOf(action);
-            }
-
-            if (id.isEmpty()) {
-                continue;
-            }
-
-            if (builder.length() > 0) {
-                builder.append(", ");
-            }
-            builder.append(id);
-        }
-
-        return builder.length() > 0 ? builder.toString() : "unknown";
-    }
-
-    private static JSONObject firstObject(JSONArray array) {
-        if (array == null || array.length() == 0) {
-            return null;
-        }
-        return array.optJSONObject(0);
-    }
-
-    private static String firstNonEmpty(String first, String second) {
-        return !safe(first).isEmpty() ? safe(first) : safe(second);
-    }
-
-    private static String safe(String value) {
-        return value != null ? value : "";
-    }
+    private static String safe(String value) { return value != null ? value : ""; }
 }

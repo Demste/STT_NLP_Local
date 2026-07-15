@@ -17,22 +17,15 @@ namespace Game.NLP
         public string ActiveLlmConfigSummary => BuildLlmConfigSummary(ConfigJson);
 
         public const string DefaultConfigJson =
-            "{\"version\":1,"
-            + "\"target_policy\":\"open_vocabulary\","
-            + "\"unknown_action\":\"unknown\","
+            "{\"version\":3,"
+            + "\"unknown_action\":\"UNKNOWN\",\"missing_action\":\"MISSING_INFO\","
             + "\"allowed_actions\":["
-            + "{\"id\":\"move_to\",\"description\":\"Move to the target.\"},"
-            + "{\"id\":\"move_above\",\"description\":\"Move above or onto the target.\"},"
-            + "{\"id\":\"move_below\",\"description\":\"Move below the target.\"},"
-            + "{\"id\":\"follow\",\"description\":\"Follow the target.\"},"
-            + "{\"id\":\"stop\",\"description\":\"Stop or hover in place.\"},"
-            + "{\"id\":\"pick_up\",\"description\":\"Pick up the target.\"},"
-            + "{\"id\":\"drop\",\"description\":\"Drop the held item.\"},"
-            + "{\"id\":\"look_at\",\"description\":\"Look at the target.\"},"
-            + "{\"id\":\"rotate_to\",\"description\":\"Rotate toward the target or direction.\"},"
-            + "{\"id\":\"unknown\",\"description\":\"No allowed action fits the utterance.\"}"
+            + "{\"id\":\"TAKE_OFF\"},{\"id\":\"LAND_HOME\"},{\"id\":\"LAND_CURRENT\"},{\"id\":\"LAND_AT_WAIT_POINT\"},"
+            + "{\"id\":\"MOVE_DIRECTION\"},{\"id\":\"MOVE_VERTICAL\"},{\"id\":\"SET_SPEED\"},{\"id\":\"TURN\"},"
+            + "{\"id\":\"FIND_OBJECT\"},{\"id\":\"TRACK_OBJECT\"},{\"id\":\"HOLD_OVER_OBJECT\"},{\"id\":\"OBSERVE_CURRENT\"},"
+            + "{\"id\":\"GO_TO_LOCATION\"},{\"id\":\"HOVER\"},{\"id\":\"FIND_MARKER\"},{\"id\":\"STOP\"},{\"id\":\"MISSING_INFO\"},{\"id\":\"UNKNOWN\"}"
             + "],"
-            + "\"llm\":{\"max_tokens\":128,\"temperature\":0.1,\"top_p\":0.95,\"top_k\":40,\"context_size\":1024,\"threads\":4}}";
+            + "\"llm\":{\"max_tokens\":128,\"classification_max_tokens\":32,\"slot_max_tokens\":64,\"temperature\":0.1,\"classification_temperature\":0.0,\"slot_temperature\":0.0,\"top_p\":0.95,\"top_k\":40,\"context_size\":1024,\"threads\":4}}";
 
         public static string BuildLlmDebugJson(string sourceConfigJson)
         {
@@ -42,7 +35,11 @@ namespace Game.NLP
             builder.Append("\"context_size\":").Append(llm.context_size).Append(",");
             builder.Append("\"threads\":").Append(llm.threads).Append(",");
             builder.Append("\"max_tokens\":").Append(llm.max_tokens).Append(",");
+            builder.Append("\"classification_max_tokens\":").Append(llm.classification_max_tokens).Append(",");
+            builder.Append("\"slot_max_tokens\":").Append(llm.slot_max_tokens).Append(",");
             builder.Append("\"temperature\":").Append(FloatString(llm.temperature)).Append(",");
+            builder.Append("\"classification_temperature\":").Append(FloatString(llm.classification_temperature)).Append(",");
+            builder.Append("\"slot_temperature\":").Append(FloatString(llm.slot_temperature)).Append(",");
             builder.Append("\"top_p\":").Append(FloatString(llm.top_p)).Append(",");
             builder.Append("\"top_k\":").Append(llm.top_k);
             builder.Append("}");
@@ -55,7 +52,11 @@ namespace Game.NLP
             return "LLM context_size=" + llm.context_size
                 + " threads=" + llm.threads
                 + " max_tokens=" + llm.max_tokens
+                + " classification_max_tokens=" + llm.classification_max_tokens
+                + " slot_max_tokens=" + llm.slot_max_tokens
                 + " temperature=" + FloatString(llm.temperature)
+                + " classification_temperature=" + FloatString(llm.classification_temperature)
+                + " slot_temperature=" + FloatString(llm.slot_temperature)
                 + " top_p=" + FloatString(llm.top_p)
                 + " top_k=" + llm.top_k;
         }
@@ -241,7 +242,11 @@ namespace Game.NLP
             public int context_size = 1024;
             public int threads = 4;
             public int max_tokens = 128;
+            public int classification_max_tokens = 32;
+            public int slot_max_tokens = 64;
             public float temperature = 0.1f;
+            public float classification_temperature = 0f;
+            public float slot_temperature = 0f;
             public float top_p = 0.95f;
             public int top_k = 40;
         }

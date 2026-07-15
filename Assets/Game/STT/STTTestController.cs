@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -302,10 +303,10 @@ namespace Game.STT
                 yield break;
             }
 
-            yield return CoRunNlp(wakeWordResult.cleanedCommand, requestId);
+            yield return CoRunNlp(wakeWordResult.cleanedCommand, transcript, requestId);
         }
 
-        private IEnumerator CoRunNlp(string cleanCommand, int requestId)
+        private IEnumerator CoRunNlp(string cleanCommand, string rawTranscript, int requestId)
         {
             if (speechCommandPipeline == null)
             {
@@ -332,7 +333,11 @@ namespace Game.STT
             RequestTiming timing = GetTiming(requestId);
             timing.nlpStopwatch.Restart();
             Task<SpeechCommandPipelineResult> pipelineTask =
-                speechCommandPipeline.ProcessTranscriptAsync(cleanCommand, _pipelineCancellation.Token, requestId.ToString(CultureInfo.InvariantCulture));
+                speechCommandPipeline.ProcessTranscriptAsync(
+                    cleanCommand,
+                    _pipelineCancellation.Token,
+                    requestId.ToString(CultureInfo.InvariantCulture),
+                    rawTranscript);
 
             while (!pipelineTask.IsCompleted)
             {
@@ -531,7 +536,7 @@ namespace Game.STT
                     continue;
                 }
 
-                bool passesGate = LooksLikeDroneCommand(cleanedCommand);
+                bool passesGate = IsPotentialCommandSuffix(cleanedCommand);
                 candidates.Add(new WakeWordParseResult(
                     true,
                     passesGate,
@@ -559,6 +564,13 @@ namespace Game.STT
             return bestRejected.foundWakeWord ? bestRejected : WakeWordParseResult.NoWakeWord;
         }
 
+        public static bool TryExtractCommandSuffixForTesting(string transcript, out string commandSuffix)
+        {
+            WakeWordParseResult result = TryExtractCommandAfterWakeWord(transcript);
+            commandSuffix = result.hasCommand ? result.cleanedCommand : string.Empty;
+            return result.hasCommand;
+        }
+
         private static bool HasTokenBoundary(string normalized, int index)
         {
             if (index < 0 || index >= normalized.Length)
@@ -582,7 +594,7 @@ namespace Game.STT
                 .Trim();
         }
 
-        private static bool LooksLikeDroneCommand(string command)
+        public static bool IsPotentialCommandSuffix(string command)
         {
             string normalized = NormalizeForWakeMatching(command);
             if (string.IsNullOrWhiteSpace(normalized))
@@ -594,13 +606,50 @@ namespace Game.STT
             {
                 "ileri", "ileriye", "geri", "geriye", "sag", "saga", "sol", "sola",
                 "yuksel", "yukari", "alcal", "asagi", "don", "git", "gel", "takip",
-                "dur", "in", "kalk", "cik", "metre", "yaklas", "uzaklas",
-                "ustune", "altina", "yanina"
+                "dur", "in", "kalk", "cik", "uc", "havalan", "metre", "hiz", "hizla", "yaklas", "uzaklas",
+                "ustune", "altina", "yanina", "bul", "ara", "izle", "bekle", "tespit",
+                "hover", "gozlem", "gozetle", "sabit"
             };
 
             foreach (string keyword in keywords)
             {
                 if (ContainsNormalizedKeyword(normalized, keyword))
+                {
+                    return true;
+                }
+            }
+
+            if (HasConservativeFusedCommandSuffix(normalized))
+            {
+                return true;
+            }
+
+            // Wake word zaten açıkça söylendi. Gate semantic son karar verici
+            // değildir; şüpheli ama boş olmayan suffix UNKNOWN ayrımı için
+            // action-first pipeline'a bırakılır.
+            return true;
+        }
+
+        private static bool HasConservativeFusedCommandSuffix(string normalized)
+        {
+            string compact = new string((normalized ?? string.Empty).Where(char.IsLetterOrDigit).ToArray());
+            string[] roots =
+            {
+                "tir", "kamyon", "kamyonet", "araba", "otomobil", "vinc", "forklift",
+                "ekskavator", "kepce", "yukleyici", "loader", "cekici", "mikser",
+                "isaret", "kare", "ucgen", "cizgi", "arti"
+            };
+            string[] suffixes = { "takipet", "tespitet", "sabitkal", "bekle", "bul", "ara", "izle", "git", "dur", "in" };
+
+            foreach (string suffix in suffixes)
+            {
+                if (!compact.EndsWith(suffix, StringComparison.Ordinal) || compact.Length <= suffix.Length)
+                {
+                    continue;
+                }
+
+                string stem = compact.Substring(0, compact.Length - suffix.Length);
+                if (roots.Any(stem.StartsWith))
                 {
                     return true;
                 }
@@ -767,25 +816,9 @@ namespace Game.STT
         private static string BuildNlpJsonResult(string cleanCommand, SpeechCommandPipelineResult result)
         {
             ValidatedCommandResult command = result != null ? result.validated : null;
-            LlmCommandResult llm = result != null ? result.llm : null;
-
-            NlpUiResult uiResult = new NlpUiResult
-            {
-                input = cleanCommand ?? string.Empty,
-                ok = command != null && command.ok,
-                stage = FirstNonEmpty(command?.stage, llm?.stage),
-                action = FirstNonEmpty(command?.action, llm?.validated_command?.action, llm?.normalized_command?.action),
-                target = FirstNonEmpty(command?.target, llm?.validated_command?.target, llm?.normalized_command?.target),
-                target_policy = command?.target_policy,
-                confidence = command != null ? command.confidence : 0f,
-                parameters = command?.parameters,
-                requires_clarification = command != null && command.requires_clarification,
-                reason = FirstNonEmpty(command?.reason, llm?.validated_command?.reason, llm?.normalized_command?.reason),
-                error = FirstNonEmpty(command?.error, llm?.error),
-                inference_ran = (command != null && command.inference_ran) || (llm != null && llm.inference_ran)
-            };
-
-            return JsonUtility.ToJson(uiResult, true);
+            return result != null && !string.IsNullOrWhiteSpace(result.finalJson)
+                ? result.finalJson
+                : DroneCommandJsonParser.ToPublicJson(command);
         }
 
         private RequestTiming GetTiming(int requestId)
@@ -922,23 +955,6 @@ namespace Game.STT
             }
 
             return string.Empty;
-        }
-
-        [Serializable]
-        private sealed class NlpUiResult
-        {
-            public string input;
-            public bool ok;
-            public string stage;
-            public string action;
-            public string target;
-            public string target_policy;
-            public float confidence;
-            public CommandParameters parameters;
-            public bool requires_clarification;
-            public string reason;
-            public string error;
-            public bool inference_ran;
         }
 
         private readonly struct WakeWordParseResult

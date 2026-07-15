@@ -19,9 +19,39 @@ def build_analysis(doc) -> Dict[str, Any]:
         "root": root,
         "action_candidates": _action_candidates(doc),
         "noun_candidates": _noun_candidates(doc),
-        "target_candidates": _target_candidates(doc),
+        "object_phrase_candidates": _object_phrase_candidates(doc),
         "spatial_phrase_candidates": _spatial_phrase_candidates(doc),
     }
+
+
+def build_compact_evidence(analysis: Dict[str, Any], limit: int = 6) -> Dict[str, Any]:
+    """Return bounded, deduplicated linguistic hints for the LLM prompt."""
+    root = analysis.get("root") or {}
+    return {
+        "root_lemma": root.get("normalized_lemma") or root.get("lemma") or "",
+        "action_candidates": _compact_values(analysis.get("action_candidates"), limit),
+        "noun_candidates": _compact_values(analysis.get("noun_candidates"), limit),
+        "object_phrase_candidates": _compact_values(analysis.get("object_phrase_candidates"), limit, phrase=True),
+        "spatial_phrase_candidates": _compact_values(analysis.get("spatial_phrase_candidates"), limit),
+    }
+
+
+def _compact_values(values, limit: int, phrase: bool = False) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        text = value.get("text") if phrase else (value.get("lemma") or value.get("text"))
+        text = str(text or "").strip()
+        key = normalize_turkish(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def find_root(doc):
@@ -101,7 +131,7 @@ def _noun_candidates(doc) -> List[Dict[str, Any]]:
     return candidates
 
 
-def _target_candidates(doc) -> List[Dict[str, Any]]:
+def _object_phrase_candidates(doc) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     seen = set()
 
@@ -136,7 +166,7 @@ def _target_candidates(doc) -> List[Dict[str, Any]]:
             "head_i": token.i,
             "head_text": token.text,
             "normalized": normalize_turkish(text),
-            "source": "open_vocabulary_noun_phrase",
+            "source": "drone_domain_object_phrase",
         })
 
     return candidates

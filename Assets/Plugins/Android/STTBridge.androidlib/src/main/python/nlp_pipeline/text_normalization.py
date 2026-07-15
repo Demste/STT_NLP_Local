@@ -22,7 +22,8 @@ def repair_common_mojibake(value: str) -> str:
     return value
 
 
-def normalize_turkish(value: str) -> str:
+def normalize_turkish_text(value: str) -> str:
+    """Normalize Turkish text while preserving semantic word boundaries."""
     text = repair_common_mojibake(value or "")
     text = unicodedata.normalize("NFKC", text).casefold()
     replacements = {
@@ -41,5 +42,15 @@ def normalize_turkish(value: str) -> str:
 
     decomposed = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
-    return re.sub(r"[^0-9a-z]+", "", text)
+    text = re.sub(r"[^0-9a-z.,/+\-]+", " ", text).strip()
+    return re.sub(r"\s+", " ", text)
 
+
+def normalize_turkish_key(value: str) -> str:
+    """Build a compact comparison key for aliases and enum lookup."""
+    return re.sub(r"[^0-9a-z]+", "", normalize_turkish_text(value))
+
+
+def normalize_turkish(value: str) -> str:
+    """Backward-compatible compact-key wrapper used by existing callers."""
+    return normalize_turkish_key(value)

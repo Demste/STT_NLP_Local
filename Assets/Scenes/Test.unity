@@ -645,11 +645,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Game.NLP.SpeechCommandPipeline
   config:
-    configJson: '{"version":1,"target_policy":"open_vocabulary","unknown_action":"unknown","allowed_actions":[{"id":"move_above","description":"Move
-      above or onto the target."},{"id":"move_to","description":"Move to the target."},{"id":"approach","description":"Approach
-      the target."},{"id":"follow","description":"Follow the target."},{"id":"stop","description":"Stop
-      or hover in place."},{"id":"descend","description":"Move downward."},{"id":"ascend","description":"Move
-      upward."},{"id":"unknown","description":"No allowed action fits the utterance."}]}'
+    configJson: '{"version":3,"unknown_action":"UNKNOWN","missing_action":"MISSING_INFO","allowed_actions":[{"id":"TAKE_OFF"},{"id":"LAND_HOME"},{"id":"LAND_CURRENT"},{"id":"LAND_AT_WAIT_POINT"},{"id":"MOVE_DIRECTION"},{"id":"MOVE_VERTICAL"},{"id":"SET_SPEED"},{"id":"TURN"},{"id":"FIND_OBJECT"},{"id":"TRACK_OBJECT"},{"id":"HOLD_OVER_OBJECT"},{"id":"OBSERVE_CURRENT"},{"id":"GO_TO_LOCATION"},{"id":"HOVER"},{"id":"FIND_MARKER"},{"id":"STOP"},{"id":"MISSING_INFO"},{"id":"UNKNOWN"}],"llm":{"max_tokens":128,"classification_max_tokens":32,"slot_max_tokens":64,"temperature":0.1,"top_p":0.95,"top_k":40,"context_size":1024,"threads":4}}'
 --- !u!4 &211964761
 Transform:
   m_ObjectHideFlags: 0

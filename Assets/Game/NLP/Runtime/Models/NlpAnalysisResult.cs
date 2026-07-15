@@ -11,18 +11,34 @@ namespace Game.NLP
         public string spacy_version;
         public string input;
         public string raw_input;
+        public string wake_word_suffix;
+        public string analysis_input;
+        public bool repair_applied;
+        public string[] repair_candidates;
+        public string selected_repair;
+        public string[] repair_notes;
+        public double repair_duration_ms;
+        public string resolution_status;
         public string context_json;
         public NlpRootToken root;
         public NlpToken[] tokens;
         public NlpEntity[] entities;
         public NlpAnalysis analysis;
         public BaselineCommandHints baseline_hints;
-        public LegacyDroneCommand drone_command;
+        public ValidatedCommandResult drone_command;
         public SemanticParserStatus semantic_parser;
         public string stage;
         public string error;
         public string exception_type;
         public string traceback;
+        public double spacy_duration_ms;
+        public double baseline_duration_ms;
+        public double action_resolution_duration_ms;
+        public double slot_extraction_duration_ms;
+        public double validation_duration_ms;
+        public double total_duration_ms;
+        public string resolution_source;
+        public bool llm_called;
 
         public bool HasError => !ok || !string.IsNullOrWhiteSpace(error);
     }
@@ -35,7 +51,7 @@ namespace Game.NLP
         public NlpRootToken root;
         public NlpCandidate[] action_candidates;
         public NlpCandidate[] noun_candidates;
-        public NlpTargetCandidate[] target_candidates;
+        public NlpTargetCandidate[] object_phrase_candidates;
         public NlpCandidate[] spatial_phrase_candidates;
     }
 
@@ -109,29 +125,31 @@ namespace Game.NLP
     [Serializable]
     public sealed class BaselineCommandHints
     {
-        public string action_hint;
-        public string target_hint;
-        public string spatial_relation_hint;
-        public string spatial_relation_text;
-        public float confidence;
-        public string reason;
         public bool final_parser;
-    }
-
-    [Serializable]
-    public sealed class LegacyDroneCommand
-    {
-        public string action;
-        public string target;
-        public string target_text;
-        public string color;
-        public string color_text;
-        public string spatial_relation;
-        public string spatial_relation_text;
-        public float confidence;
-        public string reason;
-        public bool deprecated;
-        public bool final_parser;
+        public string resolution_status;
+        public string domain;
+        public string resolution_source;
+        public bool llm_called;
+        public ValidatedCommandResult command_candidate;
+        public string detected_object_phrase;
+        public string[] action_candidates;
+        public string[] direction_candidates;
+        public string[] turn_direction_candidates;
+        public double[] distance_candidates;
+        public double[] duration_candidates;
+        public double[] angle_candidates;
+        public double[] speed_candidates;
+        public string[] object_candidates;
+        public string[] color_candidates;
+        public string[] shape_candidates;
+        public long[] marker_index_candidates;
+        public string[] location_candidates;
+        public DroneCoordinate[] coordinate_candidates;
+        public string[] observe_mode_candidates;
+        public double baseline_duration_ms;
+        public double action_resolution_duration_ms;
+        public double slot_extraction_duration_ms;
+        public double validation_duration_ms;
     }
 
     [Serializable]

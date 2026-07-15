@@ -207,12 +207,12 @@ namespace Game.NLP
                 string summary =
                     "ok: false"
                     + "\nstage: " + stage
+                    + "\nresolution_source: " + DisplayValue(result.resolutionSource)
+                    + "\nllm_called: " + BoolText(result.llmCalled)
                     + "\ninference_ran: " + BoolText(llm != null && llm.inference_ran)
                     + "\njson_repair_applied: " + BoolText(llm != null && llm.json_repair_applied)
                     + "\naction: " + DisplayValue(ExtractAction(llm))
-                    + "\ntarget: " + DisplayValue(ExtractTarget(llm))
                     + "\nconfidence: " + ExtractConfidence(null, llm).ToString("0.00")
-                    + "\nreason: " + DisplayValue(ExtractReason(null, llm))
                     + "\nerror: " + error;
                 string debugJson = BuildDebugJson(result);
                 SetStatus("Komut üretilemedi. stage: " + stage);
@@ -225,10 +225,10 @@ namespace Game.NLP
                 return;
             }
 
-            string statusStage = FirstNonEmpty(command?.stage, llm?.stage, "validated");
+            string statusStage = FirstNonEmpty(llm?.stage, "validated");
             string commandSummary = BuildCommandSummary(command, llm, statusStage);
             string rawDebugJson = BuildDebugJson(result);
-            SetStatus(command.ok ? "Komut doğrulandı." : "Komut doğrulanamadı. stage: " + statusStage);
+            SetStatus(llm != null && llm.ok ? "Komut doğrulandı." : "Komut doğrulanamadı. stage: " + statusStage);
             SetCommandText(commandSummary);
             SetRawJson(rawDebugJson);
             LogLong("[SpeechCommandDebugPanel] validated_command:", commandSummary);
@@ -425,6 +425,9 @@ namespace Game.NLP
             builder.AppendLine("  \"transcript\": \"" + EscapeForDisplay(result.transcript) + "\",");
             builder.AppendLine("  \"active_llm_config\": " + SafeJsonObject(result.activeLlmConfigJson) + ",");
             builder.AppendLine("  \"active_llm_config_summary\": \"" + EscapeForDisplay(result.activeLlmConfigSummary) + "\",");
+            builder.AppendLine("  \"resolution_source\": \"" + EscapeForDisplay(result.resolutionSource) + "\",");
+            builder.AppendLine("  \"llm_called\": " + (result.llmCalled ? "true" : "false") + ",");
+            builder.AppendLine("  \"final_command\": " + (string.IsNullOrWhiteSpace(result.finalJson) ? "null" : result.finalJson) + ",");
             AppendValidatedSummary(builder, result);
             builder.AppendLine(",");
             AppendJsonField(builder, "nlp_spacy_output", result.nlpJson, false);
@@ -481,23 +484,49 @@ namespace Game.NLP
         private static string BuildCommandSummary(ValidatedCommandResult command, LlmCommandResult llm, string stage)
         {
             string action = FirstNonEmpty(command?.action, ExtractAction(llm));
-            string target = FirstNonEmpty(command?.target, ExtractTarget(llm));
             float confidence = ExtractConfidence(command, llm);
-            string reason = FirstNonEmpty(command?.reason, ExtractReason(command, llm));
-            string error = FirstNonEmpty(command?.error, llm?.error);
-            string errors = JoinArray(command?.errors);
-            string warnings = JoinArray(command?.warnings);
-            bool inferenceRan = (command != null && command.inference_ran) || (llm != null && llm.inference_ran);
+            string error = llm?.error;
+            string errors = JoinArray(llm?.errors);
+            string warnings = JoinArray(llm?.warnings);
+            bool inferenceRan = llm != null && llm.inference_ran;
 
-            StringBuilder builder = new StringBuilder(256);
-            builder.Append("ok: ").Append(BoolText(command != null && command.ok));
-            builder.Append("\nstage: ").Append(DisplayValue(FirstNonEmpty(stage, command?.stage, llm?.stage)));
+            StringBuilder builder = new StringBuilder(512);
+            builder.Append("ok: ").Append(BoolText(llm != null && llm.ok));
+            builder.Append("\ncontract_version: ").Append(DisplayValue(llm?.contract_version));
+            builder.Append("\nstage: ").Append(DisplayValue(FirstNonEmpty(stage, llm?.stage)));
+            builder.Append("\nresolution_source: ").Append(DisplayValue(llm?.resolution_source));
+            builder.Append("\nresolution_status: ").Append(DisplayValue(llm?.resolution_status));
+            builder.Append("\nllm_called: ").Append(BoolText(llm != null && llm.llm_called));
+            builder.Append("\naction_llm_called: ").Append(BoolText(llm != null && llm.action_llm_called));
+            builder.Append("\nslot_llm_called: ").Append(BoolText(llm != null && llm.slot_llm_called));
+            builder.Append("\nslot_evidence_valid: ").Append(BoolText(llm != null && llm.slot_evidence_valid));
+            builder.Append("\nanalysis_input: ").Append(DisplayValue(llm?.analysis_input));
+            builder.Append("\ndetected_object_phrase: ").Append(DisplayValue(llm?.detected_object_phrase));
             builder.Append("\ninference_ran: ").Append(BoolText(inferenceRan));
+            builder.Append("\nllm_output_valid: ").Append(BoolText(llm != null && llm.llm_output_valid));
+            builder.Append("\nbalanced_json: ").Append(BoolText(llm != null && llm.balanced_json));
+            builder.Append("\ngrammar_constrained: ").Append(BoolText(llm != null && llm.grammar_constrained));
+            if (llm != null && llm.llm_called)
+            {
+                builder.Append("\nllm_prompt_tokens: ").Append(llm.llm_prompt_tokens).Append(llm.llm_prompt_tokens_exact ? "" : " (estimate)");
+                builder.Append("\nllm_output_tokens: ").Append(llm.llm_output_tokens).Append(llm.llm_output_tokens_exact ? "" : " (estimate)");
+                builder.Append("\nllm_generation_duration: ").Append(llm.llm_generation_duration).Append(" ms");
+            }
             builder.Append("\njson_repair_applied: ").Append(BoolText(llm != null && llm.json_repair_applied));
             builder.Append("\naction: ").Append(DisplayValue(action));
-            builder.Append("\ntarget: ").Append(DisplayValue(target));
             builder.Append("\nconfidence: ").Append(confidence.ToString("0.00"));
-            builder.Append("\nreason: ").Append(DisplayValue(reason));
+            if (command != null)
+            {
+                builder.Append("\ndirection: ").Append(DisplayValue(command.direction));
+                builder.Append("\nturn_direction: ").Append(DisplayValue(command.turn_direction));
+                builder.Append("\ndistance_m: ").Append(DisplayNullable(command.distance_m));
+                builder.Append("\nangle_deg: ").Append(DisplayNullable(command.angle_deg));
+                builder.Append("\nspeed_kmh: ").Append(DisplayNullable(command.speed_kmh));
+                builder.Append("\nobject: ").Append(DisplayValue(command.@object));
+                builder.Append("\nmarker: ").Append(DisplayValue(command.color)).Append("/").Append(DisplayValue(command.shape)).Append(" #").Append(command.marker_index?.ToString() ?? "null");
+                builder.Append("\nlocation: ").Append(DisplayValue(command.location_keyword));
+                builder.Append("\nmissing: ").Append(DisplayValue(command.missing_field)).Append(" - ").Append(DisplayValue(command.missing_message));
+            }
             if (!string.IsNullOrWhiteSpace(error))
             {
                 builder.Append("\nerror: ").Append(error);
@@ -517,20 +546,24 @@ namespace Game.NLP
         {
             ValidatedCommandResult command = result != null ? result.validated : null;
             LlmCommandResult llm = result != null ? result.llm : null;
-            string stage = FirstNonEmpty(command?.stage, llm?.stage);
+            string stage = llm?.stage;
 
             builder.AppendLine("  \"validated_summary\": {");
-            builder.AppendLine("    \"ok\": " + ((command != null && command.ok) ? "true" : "false") + ",");
+            builder.AppendLine("    \"ok\": " + ((llm != null && llm.ok) ? "true" : "false") + ",");
             builder.AppendLine("    \"stage\": \"" + EscapeForDisplay(stage) + "\",");
-            builder.AppendLine("    \"inference_ran\": " + (((command != null && command.inference_ran) || (llm != null && llm.inference_ran)) ? "true" : "false") + ",");
+            builder.AppendLine("    \"resolution_source\": \"" + EscapeForDisplay(result?.resolutionSource) + "\",");
+            builder.AppendLine("    \"llm_called\": " + ((result != null && result.llmCalled) ? "true" : "false") + ",");
+            builder.AppendLine("    \"inference_ran\": " + ((llm != null && llm.inference_ran) ? "true" : "false") + ",");
+            builder.AppendLine("    \"llm_output_valid\": " + ((llm != null && llm.llm_output_valid) ? "true" : "false") + ",");
+            builder.AppendLine("    \"balanced_json\": " + ((llm != null && llm.balanced_json) ? "true" : "false") + ",");
+            builder.AppendLine("    \"failure_stage\": \"" + EscapeForDisplay(llm?.failure_stage) + "\",");
             builder.AppendLine("    \"json_repair_applied\": " + ((llm != null && llm.json_repair_applied) ? "true" : "false") + ",");
             builder.AppendLine("    \"action\": \"" + EscapeForDisplay(FirstNonEmpty(command?.action, ExtractAction(llm))) + "\",");
-            builder.AppendLine("    \"target\": \"" + EscapeForDisplay(FirstNonEmpty(command?.target, ExtractTarget(llm))) + "\",");
             builder.AppendLine("    \"confidence\": " + ExtractConfidence(command, llm).ToString("0.00") + ",");
-            builder.AppendLine("    \"reason\": \"" + EscapeForDisplay(FirstNonEmpty(command?.reason, ExtractReason(command, llm))) + "\",");
-            builder.AppendLine("    \"error\": \"" + EscapeForDisplay(FirstNonEmpty(command?.error, llm?.error)) + "\",");
-            builder.AppendLine("    \"errors\": \"" + EscapeForDisplay(JoinArray(command?.errors)) + "\",");
-            builder.AppendLine("    \"warnings\": \"" + EscapeForDisplay(JoinArray(command?.warnings)) + "\"");
+            builder.AppendLine("    \"error\": \"" + EscapeForDisplay(llm?.error) + "\",");
+            builder.AppendLine("    \"errors\": \"" + EscapeForDisplay(JoinArray(llm?.errors)) + "\",");
+            builder.AppendLine("    \"warnings\": \"" + EscapeForDisplay(JoinArray(llm?.warnings)) + "\",");
+            builder.AppendLine("    \"public_command\": " + DroneCommandJsonParser.ToPublicJson(command));
             builder.Append("  }");
         }
 
@@ -661,37 +694,24 @@ namespace Game.NLP
                 llm?.normalized_command?.action);
         }
 
-        private static string ExtractTarget(LlmCommandResult llm)
-        {
-            return FirstNonEmpty(
-                llm?.validated_command?.target,
-                llm?.normalized_command?.target);
-        }
-
         private static float ExtractConfidence(ValidatedCommandResult command, LlmCommandResult llm)
         {
-            if (command != null && command.confidence > 0f)
+            if (command != null && command.confidence > 0d)
             {
-                return command.confidence;
+                return (float)command.confidence;
             }
-            if (llm?.validated_command != null && llm.validated_command.confidence > 0f)
+            if (llm?.validated_command != null && llm.validated_command.confidence > 0d)
             {
-                return llm.validated_command.confidence;
+                return (float)llm.validated_command.confidence;
             }
-            if (llm?.normalized_command != null && llm.normalized_command.confidence > 0f)
+            if (llm?.normalized_command != null && llm.normalized_command.confidence > 0d)
             {
-                return llm.normalized_command.confidence;
+                return (float)llm.normalized_command.confidence;
             }
             return 0f;
         }
 
-        private static string ExtractReason(ValidatedCommandResult command, LlmCommandResult llm)
-        {
-            return FirstNonEmpty(
-                command?.reason,
-                llm?.validated_command?.reason,
-                llm?.normalized_command?.reason);
-        }
+        private static string DisplayNullable(double? value) => value.HasValue ? value.Value.ToString("0.###") : "null";
 
         private static string JoinArray(string[] values)
         {
