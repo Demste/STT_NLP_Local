@@ -123,5 +123,9 @@ InitTestScene*.unity*
 /Tools/whisper-android/**/Makefile
 /Assets/Plugins/Android/STTBridge.androidlib/src/main/jniLibs/arm64-v8a/libstt_whisper.so.backup
 
+# Whisper STT supports only the official multilingual base model asset.
+/Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/whisper/*.bin
+!/Assets/Plugins/Android/STTBridge.androidlib/src/main/assets/whisper/ggml-base.bin
+
 # Local third-party checkout - keep locally, do not commit
 /Tools/third_party/

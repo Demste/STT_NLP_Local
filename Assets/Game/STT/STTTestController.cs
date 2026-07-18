@@ -274,8 +274,11 @@ namespace Game.STT
                 yield break;
             }
 
-            string transcript = result.text?.Trim() ?? string.Empty;
-            Debug.Log($"[STT] request_id={requestId} whisper_duration={FormatSeconds(timing.whisperSeconds)} transcript=\"{EscapeForLog(transcript)}\"");
+            string rawTranscript = result.text ?? string.Empty;
+            string transcript = rawTranscript.Trim();
+            Debug.Log(
+                $"[STT] request_id={requestId} whisper_duration={FormatSeconds(timing.whisperSeconds)} " +
+                $"raw_transcript=\"{EscapeForLog(rawTranscript)}\" normalized_transcript=\"{EscapeForLog(transcript)}\"");
             SetStatus("Whisper sonucu alındı", requestId);
             SetWhisperResult(transcript, requestId);
             SetTimingText(timing, requestId);
@@ -308,7 +311,7 @@ namespace Game.STT
                 yield break;
             }
 
-            yield return CoRunNlp(wakeWordResult.cleanedCommand, transcript, requestId);
+            yield return CoRunNlp(wakeWordResult.cleanedCommand, rawTranscript, requestId);
         }
 
         private IEnumerator CoRunNlp(string cleanCommand, string rawTranscript, int requestId)

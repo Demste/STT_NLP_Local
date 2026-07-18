@@ -33,7 +33,6 @@ import java.security.MessageDigest;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
 
 public final class STTBridge {
     private static final String TAG = "STTBridge";
@@ -41,12 +40,11 @@ public final class STTBridge {
     private static final String PROVIDER_WHISPER = "whisper_cpp_offline";
 
     private static final String WHISPER_ASSET_DIR = "whisper";
-    private static final String WHISPER_MODEL_ASSET = WHISPER_ASSET_DIR + "/ggml-tiny-q5_1.bin";
-    private static final String WHISPER_MODEL_HASH_ASSET = WHISPER_MODEL_ASSET + ".sha256";
+    private static final String WHISPER_MODEL_ASSET = WHISPER_ASSET_DIR + "/ggml-base.bin";
+    private static final String WHISPER_EXPECTED_ASSET_PATH = "assets/" + WHISPER_MODEL_ASSET;
     private static final String WHISPER_MODEL_OUTPUT_DIR = "stt_models/whisper";
     private static final int WHISPER_THREAD_COUNT = 4;
     private static final Object WHISPER_STATE_LOCK = new Object();
-    private static final AtomicLong WHISPER_REQUEST_SEQUENCE = new AtomicLong();
     private static final ExecutorService WHISPER_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "stt-whisper-worker");
         thread.setDaemon(true);
@@ -320,22 +318,28 @@ public final class STTBridge {
             }
 
             long durationMs = System.currentTimeMillis() - started;
+            Log.i(TAG, String.format(Locale.US, "[WhisperTiming] durationMs=%d", durationMs));
+            Log.i(TAG, String.format(
+                    Locale.US,
+                    "[WhisperResult] rawTranscript=\"%s\" error=\"%s\"",
+                    forLog(text),
+                    forLog(error)
+            ));
             String json = buildResultJson(provider, normalizeLanguage(language), text, durationMs, wavPath, error);
             sendUnityMessage(unityGameObject, unityCallbackMethod, json);
         });
     }
 
     private static String transcribeWhisper(String wavPath, String language) throws Exception {
-        final long requestId = WHISPER_REQUEST_SEQUENCE.incrementAndGet();
-
         synchronized (WHISPER_STATE_LOCK) {
             ensureWhisperNativeLoaded();
 
             Context context = getUnityAppContextOrThrow();
-            ResolvedWhisperModel resolved = resolveWhisperModel(context);
-            String modelPath = resolved.file.getAbsolutePath();
+            Log.i(TAG, "[WhisperModel] expected=" + WHISPER_EXPECTED_ASSET_PATH);
+            File modelFile = resolveWhisperModel(context);
+            String modelPath = modelFile.getAbsolutePath();
+            String normalizedLanguage = normalizeLanguage(language);
             boolean modelAlreadyLoaded = whisperNativeHandle != 0L && modelPath.equals(whisperLoadedModelPath);
-            double modelInitMs = 0.0;
 
             if (!modelAlreadyLoaded) {
                 if (whisperNativeHandle != 0L) {
@@ -344,9 +348,7 @@ public final class STTBridge {
                     whisperLoadedModelPath = "";
                 }
 
-                long initStarted = System.nanoTime();
                 whisperNativeHandle = whisperInitNative(modelPath, WHISPER_THREAD_COUNT);
-                modelInitMs = elapsedMs(initStarted);
                 if (whisperNativeHandle == 0L) {
                     throw new IllegalStateException("whisper.cpp model context init sıfır handle döndürdü: " + modelPath);
                 }
@@ -356,31 +358,9 @@ public final class STTBridge {
             String nativeJson = whisperTranscribeNative(
                     whisperNativeHandle,
                     wavPath,
-                    normalizeLanguage(language)
+                    normalizedLanguage
             );
             WhisperNativeResult nativeResult = WhisperNativeResult.parse(nativeJson);
-
-            Log.i(TAG, String.format(
-                    Locale.US,
-                    "[WhisperTiming] requestId=%d model=%s loaded=%s modelAlreadyLoaded=%s " +
-                            "modelResolveMs=%.3f modelCopyMs=%.3f modelInitMs=%.3f " +
-                            "audioPrepareMs=%.3f whisperFullMs=%.3f resultReadMs=%.3f " +
-                            "jniTotalMs=%.3f audioSec=%.3f threads=%d modelCopied=%s",
-                    requestId,
-                    resolved.file.getName(),
-                    modelAlreadyLoaded,
-                    modelAlreadyLoaded,
-                    resolved.resolveMs,
-                    resolved.copyMs,
-                    modelInitMs,
-                    nativeResult.audioPrepareMs,
-                    nativeResult.whisperFullMs,
-                    nativeResult.resultReadMs,
-                    nativeResult.jniTotalMs,
-                    nativeResult.audioDurationSec,
-                    WHISPER_THREAD_COUNT,
-                    resolved.copied
-            ));
 
             if (!nativeResult.ok) {
                 throw new IllegalStateException(nativeResult.error.isEmpty()
@@ -493,8 +473,7 @@ public final class STTBridge {
         }
     }
 
-    private static ResolvedWhisperModel resolveWhisperModel(Context context) throws Exception {
-        long resolveStarted = System.nanoTime();
+    private static File resolveWhisperModel(Context context) throws Exception {
         AssetManager assets = context.getAssets();
         File outputDir = new File(context.getFilesDir(), WHISPER_MODEL_OUTPUT_DIR);
 
@@ -502,44 +481,55 @@ public final class STTBridge {
             throw new IOException("Klasör oluşturulamadı: " + outputDir);
         }
 
-        String expectedHash;
-        try (InputStream hashInput = assets.open(WHISPER_MODEL_HASH_ASSET)) {
-            expectedHash = readUtf8(hashInput).trim().toLowerCase(Locale.ROOT);
-        } catch (IOException e) {
-            throw new IOException("Whisper model hash asset eksik: " + WHISPER_MODEL_HASH_ASSET, e);
+        if (!assetExists(assets, WHISPER_MODEL_ASSET)) {
+            throw new IOException(
+                    "Whisper base model not found. Expected " + WHISPER_EXPECTED_ASSET_PATH);
         }
-        if (!expectedHash.matches("[0-9a-f]{64}")) {
-            throw new IOException("Whisper model SHA-256 geçersiz: " + WHISPER_MODEL_HASH_ASSET);
-        }
+
+        String expectedHash = readOptionalModelHash(assets, WHISPER_MODEL_ASSET);
 
         File outputFile = new File(outputDir, new File(WHISPER_MODEL_ASSET).getName());
         File markerFile = new File(outputDir, outputFile.getName() + ".sha256");
         boolean outputExists = outputFile.isFile() && outputFile.length() > 0L;
-        boolean validExisting = outputExists && expectedHash.equals(readSmallTextFile(markerFile));
-        if (outputExists && !validExisting && expectedHash.equals(sha256File(outputFile))) {
-            writeSmallTextFile(markerFile, expectedHash);
-            validExisting = true;
+        boolean hashAvailable = !expectedHash.isEmpty();
+        boolean validExisting = outputExists;
+        if (outputExists && hashAvailable) {
+            validExisting = expectedHash.equals(readSmallTextFile(markerFile));
+            if (!validExisting && expectedHash.equals(sha256File(outputFile))) {
+                writeSmallTextFile(markerFile, expectedHash);
+                validExisting = true;
+            }
         }
-        double copyMs = 0.0;
-        boolean copied = false;
-
         if (!validExisting) {
-            long copyStarted = System.nanoTime();
-            copyVerifiedAsset(assets, WHISPER_MODEL_ASSET, expectedHash, outputFile, markerFile);
-            copyMs = elapsedMs(copyStarted);
-            copied = true;
+            copyModelAsset(assets, WHISPER_MODEL_ASSET, expectedHash, outputFile, markerFile);
         }
 
-        double totalResolveMs = elapsedMs(resolveStarted);
-        return new ResolvedWhisperModel(
-                outputFile,
-                Math.max(0.0, totalResolveMs - copyMs),
-                copyMs,
-                copied
-        );
+        return outputFile;
     }
 
-    private static void copyVerifiedAsset(
+    private static boolean assetExists(AssetManager assets, String assetPath) {
+        try (InputStream ignored = assets.open(assetPath)) {
+            return true;
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private static String readOptionalModelHash(AssetManager assets, String modelAsset) throws IOException {
+        String hashAsset = modelAsset + ".sha256";
+        if (!assetExists(assets, hashAsset)) return "";
+
+        String expectedHash;
+        try (InputStream hashInput = assets.open(hashAsset)) {
+            expectedHash = readUtf8(hashInput).trim().toLowerCase(Locale.ROOT);
+        }
+        if (!expectedHash.matches("[0-9a-f]{64}")) {
+            throw new IOException("Whisper model SHA-256 geçersiz: " + hashAsset);
+        }
+        return expectedHash;
+    }
+
+    private static void copyModelAsset(
             AssetManager assets,
             String assetPath,
             String expectedHash,
@@ -568,7 +558,7 @@ public final class STTBridge {
         }
 
         String actualHash = toHex(digest.digest());
-        if (!expectedHash.equals(actualHash)) {
+        if (!expectedHash.isEmpty() && !expectedHash.equals(actualHash)) {
             tempFile.delete();
             throw new IOException("Whisper model SHA-256 uyuşmuyor. expected=" + expectedHash + " actual=" + actualHash);
         }
@@ -585,7 +575,9 @@ public final class STTBridge {
             throw new IOException("Whisper model temp dosyası etkinleştirilemedi: " + outputFile);
         }
 
-        writeSmallTextFile(markerFile, expectedHash);
+        if (!expectedHash.isEmpty()) {
+            writeSmallTextFile(markerFile, expectedHash);
+        }
     }
 
     private static String readUtf8(InputStream input) throws IOException {
@@ -644,24 +636,6 @@ public final class STTBridge {
         return toHex(digest.digest());
     }
 
-    private static double elapsedMs(long startedNanos) {
-        return (System.nanoTime() - startedNanos) / 1_000_000.0;
-    }
-
-    private static final class ResolvedWhisperModel {
-        final File file;
-        final double resolveMs;
-        final double copyMs;
-        final boolean copied;
-
-        ResolvedWhisperModel(File file, double resolveMs, double copyMs, boolean copied) {
-            this.file = file;
-            this.resolveMs = resolveMs;
-            this.copyMs = copyMs;
-            this.copied = copied;
-        }
-    }
-
     private static final class WhisperNativeResult {
         final boolean ok;
         final String text;
@@ -718,6 +692,10 @@ public final class STTBridge {
 
     private static String safe(String value) {
         return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static String forLog(String value) {
+        return safe(value).replace("\r", "\\r").replace("\n", "\\n");
     }
 
 }

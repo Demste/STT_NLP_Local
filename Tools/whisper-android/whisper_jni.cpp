@@ -25,6 +25,16 @@ constexpr int kRequiredSampleRate = 16000;
 constexpr int kDefaultThreadCount = 4;
 constexpr int kMinThreadCount = 1;
 constexpr int kMaxThreadCount = 6;
+constexpr const char * kTurkishDroneInitialPrompt =
+        u8"Kartal drone komutları: havalan, kalk, uç, in, kalktığın yere in, eve dön, "
+        u8"bulunduğun yere in, mevcut konuma in, bekleme noktasına in, "
+        u8"ileri git, geri git, sağa git, sola git, yüksel, yukarı çık, aşağı in, alçal, "
+        u8"hızını ayarla, kilometre saat, derece dön, saat yönünde dön, saat yönünün tersine dön, "
+        u8"tırı bul, kamyonu bul, arabayı bul, ekskavatörü bul, yükleyiciyi bul, forklifti bul, "
+        u8"beton mikserini bul, vinç bul, takip et, izle, üzerinde dur, hover yap, "
+        u8"gözlem yap, konuma git, marker bul, kırmızı çizgiyi bul, yeşil kareyi bul, "
+        u8"mavi üçgeni bul, beyaz artı işaretini bul, dur, bekle, "
+        u8"sabit kal, hareket etme.";
 
 using Clock = std::chrono::steady_clock;
 
@@ -367,11 +377,25 @@ Java_com_mehmet_sttbridge_STTBridge_whisperTranscribeNative(
     params.no_context = true;
     params.no_timestamps = true;
     params.single_segment = true;
+    params.max_len = 0;
+    params.max_tokens = 0;
+    params.initial_prompt = kTurkishDroneInitialPrompt;
+    params.carry_initial_prompt = false;
+    params.temperature = 0.0F;
+    params.temperature_inc = 0.0F;
     params.print_progress = false;
     params.print_realtime = false;
     params.print_timestamps = false;
     params.print_special = false;
     params.n_threads = session->thread_count;
+
+    __android_log_print(
+            ANDROID_LOG_INFO,
+            kLogTag,
+            "[WhisperConfig] language=%s translate=false temperature=0.0 noTimestamps=true "
+            "singleSegment=true maxLen=0 maxTokens=0 initialPrompt=turkish_drone_commands_v1 threads=%d",
+            language.c_str(),
+            session->thread_count);
 
     const auto inference_started = Clock::now();
     const int inference_status = whisper_full(
