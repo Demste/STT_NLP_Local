@@ -157,7 +157,9 @@ def resolve_action(phrase: str) -> Tuple[str, float]:
         return "FIND_OBJECT", .97 if obj else .88
     if _has_any(phrase, "havada dur", "havada bekle", "hover", "havada sabit kal"):
         return "HOVER", .98
-    if _has(phrase, "don") and (_turn_direction(phrase) is not None or _quantity(phrase, r"derece") is not None):
+    if _compound_turn_and_move(phrase):
+        return "UNKNOWN", 0.0
+    if _has_turn_context(phrase) and (_turn_direction(phrase) is not None or _quantity(phrase, r"derece") is not None):
         return "TURN", .96
     if _speed_quantity(phrase) is not None or _has_any(phrase, "hizli", "yavas", "hizlan", "hizini", "hizi", "hizla"):
         return "SET_SPEED", .95
@@ -359,9 +361,21 @@ def _vertical_direction(phrase: str):
 def _turn_direction(phrase: str):
     if "saat yonunun ters" in phrase: return "COUNTER_CLOCKWISE"
     if "saat yonunde" in phrase: return "CLOCKWISE"
-    if re.search(r"\bsaga\b", phrase): return "RIGHT"
-    if re.search(r"\bsola\b", phrase): return "LEFT"
+    if re.search(r"\b(?:saga|sag(?:\s+(?:tarafa|yon(?:e|une)?))?)\b", phrase): return "RIGHT"
+    if re.search(r"\b(?:sola|sol(?:\s+(?:tarafa|yon(?:e|une)?))?)\b", phrase): return "LEFT"
     return None
+
+
+def _has_turn_context(phrase: str) -> bool:
+    return _has_any(phrase, "don", "cevir", "yonel", "donus yap")
+
+
+def _compound_turn_and_move(phrase: str) -> bool:
+    words = _words_phrase(phrase)
+    turn = r"(?:don|cevir|yonel|donus\s+yap)"
+    move = r"(?:git|ilerle|hareket\s+et)"
+    return bool(re.search(r"\b" + turn + r"\b.*\bve\b.*\b" + move + r"\b", words)
+                or re.search(r"\b" + move + r"\b.*\bve\b.*\b" + turn + r"\b", words))
 
 
 def _has(phrase: str, root: str) -> bool:

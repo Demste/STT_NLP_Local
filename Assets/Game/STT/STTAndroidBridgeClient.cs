@@ -57,5 +57,13 @@ namespace Game.STT
             return false;
 #endif
         }
+
+        public void ReleaseWhisper()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            bridge.CallStatic("releaseWhisper");
+#endif
+        }
     }
 }

@@ -18,8 +18,8 @@ import android.util.Log;
 import androidx.core.content.FileProvider;
 
 import org.json.JSONObject;
+import java.io.ByteArrayOutputStream;
 import java.io.BufferedInputStream;
-import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -29,7 +29,11 @@ import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class STTBridge {
     private static final String TAG = "STTBridge";
@@ -37,9 +41,22 @@ public final class STTBridge {
     private static final String PROVIDER_WHISPER = "whisper_cpp_offline";
 
     private static final String WHISPER_ASSET_DIR = "whisper";
+    private static final String WHISPER_MODEL_ASSET = WHISPER_ASSET_DIR + "/ggml-tiny-q5_1.bin";
+    private static final String WHISPER_MODEL_HASH_ASSET = WHISPER_MODEL_ASSET + ".sha256";
+    private static final String WHISPER_MODEL_OUTPUT_DIR = "stt_models/whisper";
+    private static final int WHISPER_THREAD_COUNT = 4;
+    private static final Object WHISPER_STATE_LOCK = new Object();
+    private static final AtomicLong WHISPER_REQUEST_SEQUENCE = new AtomicLong();
+    private static final ExecutorService WHISPER_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "stt-whisper-worker");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private static boolean whisperLoadTried;
     private static boolean whisperNativeLoaded;
+    private static long whisperNativeHandle;
+    private static String whisperLoadedModelPath = "";
 
     private STTBridge() {}
 
@@ -286,7 +303,7 @@ public final class STTBridge {
             final String unityGameObject,
             final String unityCallbackMethod) {
 
-        new Thread(() -> {
+        WHISPER_EXECUTOR.execute(() -> {
             long started = System.currentTimeMillis();
             String text = "";
             String error = "";
@@ -305,28 +322,88 @@ public final class STTBridge {
             long durationMs = System.currentTimeMillis() - started;
             String json = buildResultJson(provider, normalizeLanguage(language), text, durationMs, wavPath, error);
             sendUnityMessage(unityGameObject, unityCallbackMethod, json);
-        }, "stt-bridge-thread").start();
+        });
     }
 
     private static String transcribeWhisper(String wavPath, String language) throws Exception {
-        ensureWhisperNativeLoaded();
+        final long requestId = WHISPER_REQUEST_SEQUENCE.incrementAndGet();
 
-        Context context = getUnityAppContextOrThrow();
-        File modelFile = copyFirstExistingAssetFile(
-                context,
-                new String[] {
-                        WHISPER_ASSET_DIR + "/ggml-base.bin",
-                        WHISPER_ASSET_DIR + "/ggml-small.bin",
-                        WHISPER_ASSET_DIR + "/ggml-tiny.bin"
-                },
-                "stt_models/whisper"
-        );
+        synchronized (WHISPER_STATE_LOCK) {
+            ensureWhisperNativeLoaded();
 
-        if (modelFile == null || !modelFile.exists()) {
-            throw new IllegalStateException("whisper.cpp modeli eksik. assets/whisper/ggml-base.bin veya ggml-small.bin veya ggml-tiny.bin koy.");
+            Context context = getUnityAppContextOrThrow();
+            ResolvedWhisperModel resolved = resolveWhisperModel(context);
+            String modelPath = resolved.file.getAbsolutePath();
+            boolean modelAlreadyLoaded = whisperNativeHandle != 0L && modelPath.equals(whisperLoadedModelPath);
+            double modelInitMs = 0.0;
+
+            if (!modelAlreadyLoaded) {
+                if (whisperNativeHandle != 0L) {
+                    whisperFreeNative(whisperNativeHandle);
+                    whisperNativeHandle = 0L;
+                    whisperLoadedModelPath = "";
+                }
+
+                long initStarted = System.nanoTime();
+                whisperNativeHandle = whisperInitNative(modelPath, WHISPER_THREAD_COUNT);
+                modelInitMs = elapsedMs(initStarted);
+                if (whisperNativeHandle == 0L) {
+                    throw new IllegalStateException("whisper.cpp model context init sıfır handle döndürdü: " + modelPath);
+                }
+                whisperLoadedModelPath = modelPath;
+            }
+
+            String nativeJson = whisperTranscribeNative(
+                    whisperNativeHandle,
+                    wavPath,
+                    normalizeLanguage(language)
+            );
+            WhisperNativeResult nativeResult = WhisperNativeResult.parse(nativeJson);
+
+            Log.i(TAG, String.format(
+                    Locale.US,
+                    "[WhisperTiming] requestId=%d model=%s loaded=%s modelAlreadyLoaded=%s " +
+                            "modelResolveMs=%.3f modelCopyMs=%.3f modelInitMs=%.3f " +
+                            "audioPrepareMs=%.3f whisperFullMs=%.3f resultReadMs=%.3f " +
+                            "jniTotalMs=%.3f audioSec=%.3f threads=%d modelCopied=%s",
+                    requestId,
+                    resolved.file.getName(),
+                    modelAlreadyLoaded,
+                    modelAlreadyLoaded,
+                    resolved.resolveMs,
+                    resolved.copyMs,
+                    modelInitMs,
+                    nativeResult.audioPrepareMs,
+                    nativeResult.whisperFullMs,
+                    nativeResult.resultReadMs,
+                    nativeResult.jniTotalMs,
+                    nativeResult.audioDurationSec,
+                    WHISPER_THREAD_COUNT,
+                    resolved.copied
+            ));
+
+            if (!nativeResult.ok) {
+                throw new IllegalStateException(nativeResult.error.isEmpty()
+                        ? "whisper.cpp native transcription failed."
+                        : nativeResult.error);
+            }
+            return nativeResult.text;
         }
+    }
 
-        return whisperTranscribeNative(modelFile.getAbsolutePath(), wavPath, language);
+    public static void releaseWhisper() {
+        synchronized (WHISPER_STATE_LOCK) {
+            if (whisperNativeHandle == 0L) return;
+
+            long handle = whisperNativeHandle;
+            whisperNativeHandle = 0L;
+            whisperLoadedModelPath = "";
+            try {
+                whisperFreeNative(handle);
+            } catch (Throwable t) {
+                Log.e(TAG, "Whisper native context release failed.", t);
+            }
+        }
     }
 
     private static void ensureWhisperNativeLoaded() {
@@ -348,7 +425,9 @@ public final class STTBridge {
         }
     }
 
-    private static native String whisperTranscribeNative(String modelPath, String wavPath, String language);
+    private static native long whisperInitNative(String modelPath, int threadCount);
+    private static native String whisperTranscribeNative(long contextHandle, String wavPath, String language);
+    private static native void whisperFreeNative(long contextHandle);
 
     private static Activity getUnityActivity() {
         try {
@@ -414,47 +493,202 @@ public final class STTBridge {
         }
     }
 
-    private static File copyFirstExistingAssetFile(Context context, String[] assetFilePaths, String outputRelativeDir) throws IOException {
+    private static ResolvedWhisperModel resolveWhisperModel(Context context) throws Exception {
+        long resolveStarted = System.nanoTime();
         AssetManager assets = context.getAssets();
-        File outputDir = new File(context.getFilesDir(), outputRelativeDir);
+        File outputDir = new File(context.getFilesDir(), WHISPER_MODEL_OUTPUT_DIR);
 
         if (!outputDir.exists() && !outputDir.mkdirs()) {
             throw new IOException("Klasör oluşturulamadı: " + outputDir);
         }
 
-        for (String assetPath : assetFilePaths) {
-            try {
-                InputStream testInput = assets.open(assetPath);
-                testInput.close();
-
-                File outputFile = new File(outputDir, new File(assetPath).getName());
-
-                if (!outputFile.exists() || outputFile.length() == 0) {
-                    InputStream input = assets.open(assetPath);
-                    OutputStream output = new FileOutputStream(outputFile);
-
-                    try {
-                        byte[] buffer = new byte[8192];
-                        int read;
-
-                        while ((read = input.read(buffer)) > 0) {
-                            output.write(buffer, 0, read);
-                        }
-
-                        output.flush();
-                    } finally {
-                        try { output.close(); } catch (IOException ignored) {}
-                        try { input.close(); } catch (IOException ignored) {}
-                    }
-                }
-
-                return outputFile;
-            } catch (IOException ignored) {
-                // Try next model name.
-            }
+        String expectedHash;
+        try (InputStream hashInput = assets.open(WHISPER_MODEL_HASH_ASSET)) {
+            expectedHash = readUtf8(hashInput).trim().toLowerCase(Locale.ROOT);
+        } catch (IOException e) {
+            throw new IOException("Whisper model hash asset eksik: " + WHISPER_MODEL_HASH_ASSET, e);
+        }
+        if (!expectedHash.matches("[0-9a-f]{64}")) {
+            throw new IOException("Whisper model SHA-256 geçersiz: " + WHISPER_MODEL_HASH_ASSET);
         }
 
-        return null;
+        File outputFile = new File(outputDir, new File(WHISPER_MODEL_ASSET).getName());
+        File markerFile = new File(outputDir, outputFile.getName() + ".sha256");
+        boolean outputExists = outputFile.isFile() && outputFile.length() > 0L;
+        boolean validExisting = outputExists && expectedHash.equals(readSmallTextFile(markerFile));
+        if (outputExists && !validExisting && expectedHash.equals(sha256File(outputFile))) {
+            writeSmallTextFile(markerFile, expectedHash);
+            validExisting = true;
+        }
+        double copyMs = 0.0;
+        boolean copied = false;
+
+        if (!validExisting) {
+            long copyStarted = System.nanoTime();
+            copyVerifiedAsset(assets, WHISPER_MODEL_ASSET, expectedHash, outputFile, markerFile);
+            copyMs = elapsedMs(copyStarted);
+            copied = true;
+        }
+
+        double totalResolveMs = elapsedMs(resolveStarted);
+        return new ResolvedWhisperModel(
+                outputFile,
+                Math.max(0.0, totalResolveMs - copyMs),
+                copyMs,
+                copied
+        );
+    }
+
+    private static void copyVerifiedAsset(
+            AssetManager assets,
+            String assetPath,
+            String expectedHash,
+            File outputFile,
+            File markerFile) throws Exception {
+
+        File tempFile = new File(outputFile.getParentFile(), outputFile.getName() + ".tmp");
+        if (tempFile.exists() && !tempFile.delete()) {
+            throw new IOException("Eski Whisper temp model silinemedi: " + tempFile);
+        }
+
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new BufferedInputStream(assets.open(assetPath));
+             FileOutputStream output = new FileOutputStream(tempFile, false)) {
+            byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = input.read(buffer)) > 0) {
+                output.write(buffer, 0, read);
+                digest.update(buffer, 0, read);
+            }
+            output.flush();
+            output.getFD().sync();
+        } catch (IOException t) {
+            if (tempFile.exists()) tempFile.delete();
+            throw t;
+        }
+
+        String actualHash = toHex(digest.digest());
+        if (!expectedHash.equals(actualHash)) {
+            tempFile.delete();
+            throw new IOException("Whisper model SHA-256 uyuşmuyor. expected=" + expectedHash + " actual=" + actualHash);
+        }
+        if (tempFile.length() == 0L) {
+            tempFile.delete();
+            throw new IOException("Whisper model asset boş kopyalandı: " + assetPath);
+        }
+        if (outputFile.exists() && !outputFile.delete()) {
+            tempFile.delete();
+            throw new IOException("Eski Whisper model dosyası değiştirilemedi: " + outputFile);
+        }
+        if (!tempFile.renameTo(outputFile)) {
+            tempFile.delete();
+            throw new IOException("Whisper model temp dosyası etkinleştirilemedi: " + outputFile);
+        }
+
+        writeSmallTextFile(markerFile, expectedHash);
+    }
+
+    private static String readUtf8(InputStream input) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int read;
+        while ((read = input.read(buffer)) > 0) {
+            output.write(buffer, 0, read);
+        }
+        return output.toString(StandardCharsets.UTF_8.name());
+    }
+
+    private static String readSmallTextFile(File file) {
+        if (file == null || !file.isFile() || file.length() <= 0L || file.length() > 1024L) return "";
+        try (InputStream input = new FileInputStream(file)) {
+            return readUtf8(input).trim().toLowerCase(Locale.ROOT);
+        } catch (IOException ignored) {
+            return "";
+        }
+    }
+
+    private static void writeSmallTextFile(File file, String value) throws IOException {
+        File temp = new File(file.getParentFile(), file.getName() + ".tmp");
+        try (FileOutputStream output = new FileOutputStream(temp, false)) {
+            output.write(value.getBytes(StandardCharsets.UTF_8));
+            output.flush();
+            output.getFD().sync();
+        }
+        if (file.exists() && !file.delete()) {
+            temp.delete();
+            throw new IOException("Whisper hash marker değiştirilemedi: " + file);
+        }
+        if (!temp.renameTo(file)) {
+            temp.delete();
+            throw new IOException("Whisper hash marker etkinleştirilemedi: " + file);
+        }
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder builder = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) {
+            builder.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+        }
+        return builder.toString();
+    }
+
+    private static String sha256File(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new BufferedInputStream(new FileInputStream(file))) {
+            byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = input.read(buffer)) > 0) {
+                digest.update(buffer, 0, read);
+            }
+        }
+        return toHex(digest.digest());
+    }
+
+    private static double elapsedMs(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000.0;
+    }
+
+    private static final class ResolvedWhisperModel {
+        final File file;
+        final double resolveMs;
+        final double copyMs;
+        final boolean copied;
+
+        ResolvedWhisperModel(File file, double resolveMs, double copyMs, boolean copied) {
+            this.file = file;
+            this.resolveMs = resolveMs;
+            this.copyMs = copyMs;
+            this.copied = copied;
+        }
+    }
+
+    private static final class WhisperNativeResult {
+        final boolean ok;
+        final String text;
+        final String error;
+        final double audioPrepareMs;
+        final double whisperFullMs;
+        final double resultReadMs;
+        final double jniTotalMs;
+        final double audioDurationSec;
+
+        WhisperNativeResult(JSONObject object) {
+            ok = object.optBoolean("ok", false);
+            text = object.optString("text", "");
+            error = object.optString("error", "");
+            audioPrepareMs = object.optDouble("audioPrepareMs", 0.0);
+            whisperFullMs = object.optDouble("whisperFullMs", 0.0);
+            resultReadMs = object.optDouble("resultReadMs", 0.0);
+            jniTotalMs = object.optDouble("jniTotalMs", 0.0);
+            audioDurationSec = object.optDouble("audioDurationSec", 0.0);
+        }
+
+        static WhisperNativeResult parse(String json) throws Exception {
+            if (json == null || json.trim().isEmpty()) {
+                throw new IllegalStateException("Whisper native result boş döndü.");
+            }
+            return new WhisperNativeResult(new JSONObject(json));
+        }
     }
 
     private static String normalizeLanguage(String language) {
@@ -486,84 +720,4 @@ public final class STTBridge {
         return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
-    private static final class WavInfo {
-        final int sampleRate;
-        final int channels;
-        final int bitsPerSample;
-        final long dataOffset;
-
-        WavInfo(int sampleRate, int channels, int bitsPerSample, long dataOffset) {
-            this.sampleRate = sampleRate;
-            this.channels = channels;
-            this.bitsPerSample = bitsPerSample;
-            this.dataOffset = dataOffset;
-        }
-
-        static WavInfo read(String wavPath) throws IOException {
-            DataInputStream input = new DataInputStream(new FileInputStream(wavPath));
-
-            try {
-                byte[] header = new byte[12];
-                input.readFully(header);
-
-                if (!"RIFF".equals(new String(header, 0, 4, StandardCharsets.US_ASCII)) ||
-                        !"WAVE".equals(new String(header, 8, 4, StandardCharsets.US_ASCII))) {
-                    throw new IOException("WAV değil: " + wavPath);
-                }
-
-                int sampleRate = 16000;
-                int channels = 1;
-                int bitsPerSample = 16;
-                long offset = 12;
-
-                while (true) {
-                    byte[] chunk = new byte[8];
-                    input.readFully(chunk);
-                    offset += 8;
-
-                    String id = new String(chunk, 0, 4, StandardCharsets.US_ASCII);
-                    int size = leInt(chunk, 4);
-
-                    if ("fmt ".equals(id)) {
-                        byte[] fmt = new byte[size];
-                        input.readFully(fmt);
-                        offset += size;
-
-                        channels = leShort(fmt, 2);
-                        sampleRate = leInt(fmt, 4);
-                        bitsPerSample = leShort(fmt, 14);
-                    } else if ("data".equals(id)) {
-                        return new WavInfo(sampleRate, channels, bitsPerSample, offset);
-                    } else {
-                        long skipped = input.skip(size);
-                        offset += skipped;
-
-                        while (skipped < size) {
-                            long more = input.skip(size - skipped);
-
-                            if (more <= 0) {
-                                throw new IOException("WAV chunk skip başarısız: " + id);
-                            }
-
-                            skipped += more;
-                            offset += more;
-                        }
-                    }
-                }
-            } finally {
-                input.close();
-            }
-        }
-
-        private static int leInt(byte[] data, int offset) {
-            return (data[offset] & 0xff) |
-                    ((data[offset + 1] & 0xff) << 8) |
-                    ((data[offset + 2] & 0xff) << 16) |
-                    ((data[offset + 3] & 0xff) << 24);
-        }
-
-        private static int leShort(byte[] data, int offset) {
-            return (data[offset] & 0xff) | ((data[offset + 1] & 0xff) << 8);
-        }
-    }
 }

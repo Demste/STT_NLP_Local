@@ -35,7 +35,7 @@ class DroneCommandTests(unittest.TestCase):
         "Kartal saatte 20 kilometre hızla git": {"action": "SET_SPEED", "speed_kmh": 20, "confidence": .95},
         "Kartal hızlı git": {"action": "MISSING_INFO", "target_action": "SET_SPEED", "missing_field": "speed_kmh", "missing_message": "Hız komutu için km/h bilgisi eksik.", "confidence": .95},
         "Kartal 90 derece sağa dön": {"action": "TURN", "turn_direction": "RIGHT", "angle_deg": 90, "confidence": .96},
-        "Kartal sağa dön": {"action": "MISSING_INFO", "turn_direction": "RIGHT", "target_action": "TURN", "missing_field": "angle_deg", "missing_message": "Dönüş komutu için açı bilgisi eksik.", "confidence": .96},
+        "Kartal sağa dön": {"action": "TURN", "turn_direction": "RIGHT", "confidence": .96},
         "Tırı bul": {"action": "FIND_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
         "TIRI, BUL!": {"action": "FIND_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
         "Tırı izle": {"action": "TRACK_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
@@ -74,12 +74,16 @@ class DroneCommandTests(unittest.TestCase):
         self.assertEqual({"action": "LAND_HOME", "confidence": .8}, result)
         self.assertTrue(any(value.startswith("field_removed:not_allowed_for_action") for value in diagnostics["warnings"]))
 
-    def test_required_fields_produce_catalogued_missing_info(self):
-        result = validate_command({"action": "TURN", "turn_direction": "RIGHT", "confidence": .9})
+    def test_turn_angle_is_optional_but_direction_is_required(self):
+        self.assertEqual(
+            {"action": "TURN", "turn_direction": "RIGHT", "confidence": .9},
+            validate_command({"action": "TURN", "turn_direction": "RIGHT", "confidence": .9}),
+        )
+        result = validate_command({"action": "TURN", "angle_deg": 90, "confidence": .9})
         self.assertEqual("MISSING_INFO", result["action"])
         self.assertEqual("TURN", result["target_action"])
-        self.assertEqual("angle_deg", result["missing_field"])
-        self.assertEqual("Dönüş komutu için açı bilgisi eksik.", result["missing_message"])
+        self.assertEqual("turn_direction", result["missing_field"])
+        self.assertEqual("Dönüş komutu için yön bilgisi eksik.", result["missing_message"])
         self.assertEqual(.9, result["confidence"])
 
     def test_every_required_action_has_a_missing_info_variant(self):
@@ -87,7 +91,7 @@ class DroneCommandTests(unittest.TestCase):
             "MOVE_DIRECTION": {"direction": "LEFT"},
             "MOVE_VERTICAL": {"direction": "UP"},
             "SET_SPEED": {},
-            "TURN": {"turn_direction": "RIGHT"},
+            "TURN": {},
             "FIND_OBJECT": {},
             "TRACK_OBJECT": {},
             "HOLD_OVER_OBJECT": {},
@@ -127,6 +131,60 @@ class DroneCommandTests(unittest.TestCase):
         unknown = json.loads(parse_command("bugün hava çok güzel"))
         self.assertFalse(unknown["llm_called"])
         self.assertEqual({"action": "UNKNOWN", "confidence": 0.0}, unknown["drone_command"])
+
+    def test_explicit_turn_phrases_are_deterministic_and_skip_spacy_and_llm(self):
+        cases = {
+            "sağ dön": ("RIGHT", None),
+            "sağa dön": ("RIGHT", None),
+            "sağ tarafa dön": ("RIGHT", None),
+            "sol dön": ("LEFT", None),
+            "sola dön": ("LEFT", None),
+            "sol tarafa dön": ("LEFT", None),
+            "90 derece sağa dön": ("RIGHT", 90),
+            "45 derece sola dön": ("LEFT", 45),
+            "sağ yönüne dön": ("RIGHT", None),
+            "sol yönüne dön": ("LEFT", None),
+            "Sağ dön.": ("RIGHT", None),
+            "SAĞA DÖN!": ("RIGHT", None),
+            "Kartal sağ dön.": ("RIGHT", None),
+        }
+        for text, (direction, angle) in cases.items():
+            with self.subTest(text=text):
+                payload = json.loads(parse_command(text))
+                command = payload["drone_command"]
+                self.assertEqual("RESOLVED", payload["resolution_status"])
+                self.assertEqual("baseline", payload["resolution_source"])
+                self.assertEqual(0.0, payload["spacy_duration_ms"])
+                self.assertFalse(payload["llm_called"])
+                self.assertEqual("TURN", command["action"])
+                self.assertEqual(direction, command["turn_direction"])
+                if angle is None:
+                    self.assertNotIn("angle_deg", command)
+                else:
+                    self.assertEqual(angle, command["angle_deg"])
+
+    def test_turn_words_do_not_steal_move_object_or_compound_commands(self):
+        movement_cases = {
+            "sağa git": "RIGHT",
+            "sağa ilerle": "RIGHT",
+            "sağa hareket et": "RIGHT",
+            "sola git": "LEFT",
+        }
+        for text, direction in movement_cases.items():
+            with self.subTest(text=text):
+                command = parse_drone_command(text)
+                self.assertEqual("MISSING_INFO", command["action"])
+                self.assertEqual("MOVE_DIRECTION", command["target_action"])
+                self.assertEqual(direction, command["direction"])
+
+        self.assertEqual("FIND_OBJECT", parse_drone_command("sağdaki arabayı bul")["action"])
+        marker = parse_drone_command("sol taraftaki işareti bul")
+        self.assertEqual("MISSING_INFO", marker["action"])
+        self.assertEqual("FIND_MARKER", marker["target_action"])
+
+        compound, diagnostics = parse_drone_command_with_diagnostics("sağa dön ve ilerle")
+        self.assertEqual("UNKNOWN", compound["action"])
+        self.assertEqual("NEEDS_ACTION_CLASSIFICATION", diagnostics["resolution_status"])
 
     def test_spacy_failure_stays_explicit_and_keeps_fixed_public_contract(self):
         previous_nlp = command_parser_module._nlp
@@ -307,7 +365,7 @@ class DroneCommandTests(unittest.TestCase):
             ("Kartal saat yönünün tersine 45 derece dön", "RESOLVED", {"action": "TURN", "turn_direction": "COUNTER_CLOCKWISE", "angle_deg": 45}),
             ("Kartal 30 derece sağa dön", "RESOLVED", {"action": "TURN", "turn_direction": "RIGHT", "angle_deg": 30}),
             ("Kartal 60 derece sola dön", "RESOLVED", {"action": "TURN", "turn_direction": "LEFT", "angle_deg": 60}),
-            ("Kartal sağa dön", "MISSING_USER_INFO", {"action": "MISSING_INFO", "turn_direction": "RIGHT", "target_action": "TURN", "missing_field": "angle_deg"}),
+            ("Kartal sağa dön", "RESOLVED", {"action": "TURN", "turn_direction": "RIGHT"}),
             # Objects
             ("Kartal tırı bul", "RESOLVED", {"action": "FIND_OBJECT", "object": "SEMI_TRUCK"}),
             ("Kartal kamyonu bul", "RESOLVED", {"action": "FIND_OBJECT", "object": "TRUCK"}),

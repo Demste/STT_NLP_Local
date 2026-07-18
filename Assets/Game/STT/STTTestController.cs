@@ -97,6 +97,11 @@ namespace Game.STT
             _pipelineCancellation?.Dispose();
         }
 
+        private void OnApplicationQuit()
+        {
+            _bridgeClient?.ReleaseWhisper();
+        }
+
         private void SetupDropdown()
         {
             if (providerDropdown == null)

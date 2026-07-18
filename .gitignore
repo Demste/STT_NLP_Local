@@ -115,6 +115,13 @@ InitTestScene*.unity*
 /Tools/llama-command-android/**/CMakeCache.txt
 /Tools/llama-command-android/**/cmake_install.cmake
 /Tools/llama-command-android/**/Makefile
+/Tools/whisper-android/build/
+/Tools/whisper-android/.cxx/
+/Tools/whisper-android/**/CMakeFiles/
+/Tools/whisper-android/**/CMakeCache.txt
+/Tools/whisper-android/**/cmake_install.cmake
+/Tools/whisper-android/**/Makefile
+/Assets/Plugins/Android/STTBridge.androidlib/src/main/jniLibs/arm64-v8a/libstt_whisper.so.backup
 
 # Local third-party checkout - keep locally, do not commit
 /Tools/third_party/

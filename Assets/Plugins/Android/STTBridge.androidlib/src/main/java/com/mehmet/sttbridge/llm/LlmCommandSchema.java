@@ -151,7 +151,7 @@ public final class LlmCommandSchema {
         value.put("MOVE_DIRECTION", new String[] {"direction", "distance_m"});
         value.put("MOVE_VERTICAL", new String[] {"direction", "distance_m"});
         value.put("SET_SPEED", new String[] {"speed_kmh"});
-        value.put("TURN", new String[] {"turn_direction", "angle_deg"});
+        value.put("TURN", new String[] {"turn_direction"});
         value.put("FIND_OBJECT", new String[] {"object"});
         value.put("TRACK_OBJECT", new String[] {"object"});
         value.put("HOLD_OVER_OBJECT", new String[] {"object"});
