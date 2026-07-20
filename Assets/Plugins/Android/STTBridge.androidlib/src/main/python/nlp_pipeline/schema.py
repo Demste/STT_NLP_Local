@@ -44,7 +44,7 @@ REQUIRED_FIELDS = {
     "MOVE_DIRECTION": ["direction", "distance_m"],
     "MOVE_VERTICAL": ["direction", "distance_m"],
     "SET_SPEED": ["speed_kmh"],
-    "TURN": ["turn_direction"],
+    "TURN": ["turn_direction", "angle_deg"],
     "FIND_OBJECT": ["object"],
     "TRACK_OBJECT": ["object"],
     "HOLD_OVER_OBJECT": ["object"],

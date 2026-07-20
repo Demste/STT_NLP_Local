@@ -35,7 +35,7 @@ class DroneCommandTests(unittest.TestCase):
         "Kartal saatte 20 kilometre hızla git": {"action": "SET_SPEED", "speed_kmh": 20, "confidence": .95},
         "Kartal hızlı git": {"action": "MISSING_INFO", "target_action": "SET_SPEED", "missing_field": "speed_kmh", "missing_message": "Hız komutu için km/h bilgisi eksik.", "confidence": .95},
         "Kartal 90 derece sağa dön": {"action": "TURN", "turn_direction": "RIGHT", "angle_deg": 90, "confidence": .96},
-        "Kartal sağa dön": {"action": "TURN", "turn_direction": "RIGHT", "confidence": .96},
+        "Kartal sağa dön": {"action": "MISSING_INFO", "turn_direction": "RIGHT", "target_action": "TURN", "missing_field": "angle_deg", "missing_message": "Dönüş komutu için açı bilgisi eksik.", "confidence": .96},
         "Tırı bul": {"action": "FIND_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
         "TIRI, BUL!": {"action": "FIND_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
         "Tırı izle": {"action": "TRACK_OBJECT", "object": "SEMI_TRUCK", "confidence": .97},
@@ -74,11 +74,10 @@ class DroneCommandTests(unittest.TestCase):
         self.assertEqual({"action": "LAND_HOME", "confidence": .8}, result)
         self.assertTrue(any(value.startswith("field_removed:not_allowed_for_action") for value in diagnostics["warnings"]))
 
-    def test_turn_angle_is_optional_but_direction_is_required(self):
-        self.assertEqual(
-            {"action": "TURN", "turn_direction": "RIGHT", "confidence": .9},
-            validate_command({"action": "TURN", "turn_direction": "RIGHT", "confidence": .9}),
-        )
+    def test_turn_angle_and_direction_are_required(self):
+        missing_angle = validate_command({"action": "TURN", "turn_direction": "RIGHT", "confidence": .9})
+        self.assertEqual("MISSING_INFO", missing_angle["action"])
+        self.assertEqual("angle_deg", missing_angle["missing_field"])
         result = validate_command({"action": "TURN", "angle_deg": 90, "confidence": .9})
         self.assertEqual("MISSING_INFO", result["action"])
         self.assertEqual("TURN", result["target_action"])
@@ -152,11 +151,14 @@ class DroneCommandTests(unittest.TestCase):
             with self.subTest(text=text):
                 payload = json.loads(parse_command(text))
                 command = payload["drone_command"]
-                self.assertEqual("RESOLVED", payload["resolution_status"])
+                self.assertEqual("RESOLVED" if angle is not None else "MISSING_USER_INFO", payload["resolution_status"])
                 self.assertEqual("baseline", payload["resolution_source"])
                 self.assertEqual(0.0, payload["spacy_duration_ms"])
                 self.assertFalse(payload["llm_called"])
-                self.assertEqual("TURN", command["action"])
+                self.assertEqual("TURN" if angle is not None else "MISSING_INFO", command["action"])
+                if angle is None:
+                    self.assertEqual("TURN", command["target_action"])
+                    self.assertEqual("angle_deg", command["missing_field"])
                 self.assertEqual(direction, command["turn_direction"])
                 if angle is None:
                     self.assertNotIn("angle_deg", command)
@@ -329,6 +331,195 @@ class DroneCommandTests(unittest.TestCase):
             if field not in ("action", "confidence", "voice_type", "stt_confidence_level"):
                 self.assertIsNone(public[field], field)
 
+    def test_command_recovery_known_variants_and_number_unit_repair(self):
+        cases = {
+            "ev edin": ("eve dön", "LAND_HOME", "KNOWN_STT_VARIANT"),
+            "ev edin.": ("eve dön", "LAND_HOME", "KNOWN_STT_VARIANT"),
+            "eve din": ("eve dön", "LAND_HOME", "KNOWN_STT_VARIANT"),
+            "ev dön": ("eve dön", "LAND_HOME", "KNOWN_STT_VARIANT"),
+            "ev edın": ("eve dön", "LAND_HOME", "KNOWN_STT_VARIANT"),
+            "alço": ("alçal", "MISSING_INFO", "KNOWN_STT_VARIANT"),
+            "alcal": ("alçal", "MISSING_INFO", "KNOWN_STT_VARIANT"),
+            "ikim etre sağa git": ("iki metre saga git", "MOVE_DIRECTION", "NUMBER_UNIT_REPAIR"),
+        }
+        for text, (corrected, action, reason) in cases.items():
+            with self.subTest(text=text):
+                command, diagnostics = parse_drone_command_with_diagnostics(text, request_key="known-variant")
+                self.assertEqual(action, command["action"])
+                self.assertTrue(diagnostics["correction_applied"])
+                self.assertEqual(corrected, diagnostics["corrected_suffix"])
+                self.assertEqual(reason, diagnostics["correction_reason"])
+                self.assertGreaterEqual(diagnostics["correction_confidence"], .90)
+                self.assertEqual("deterministic_recovery", diagnostics["parser_source"])
+
+        movement, _ = parse_drone_command_with_diagnostics("ikim etre sağa git")
+        self.assertEqual("RIGHT", movement["direction"])
+        self.assertEqual(2, movement["distance_m"])
+        down, _ = parse_drone_command_with_diagnostics("alço")
+        self.assertEqual("DOWN", down["direction"])
+        self.assertEqual("distance_m", down["missing_field"])
+
+    def test_recovery_preserves_valid_originals_and_skips_llm(self):
+        cases = {
+            "eve dön": {"action": "LAND_HOME"},
+            "20 metre sağa git": {"action": "MOVE_DIRECTION", "direction": "RIGHT", "distance_m": 20},
+            "15 metre yüksel": {"action": "MOVE_VERTICAL", "direction": "UP", "distance_m": 15},
+            "30 derece sağa dön": {"action": "TURN", "turn_direction": "RIGHT", "angle_deg": 30},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                payload = json.loads(parse_command(text))
+                self.assertFalse(payload["llm_called"])
+                self.assertFalse(payload["baseline_hints"]["correction_applied"])
+                self.assertEqual("RESOLVED_ORIGINAL", payload["baseline_hints"]["recovery_resolution_status"])
+                for field, value in expected.items():
+                    self.assertEqual(value, payload["drone_command"].get(field), field)
+
+    def test_extended_catalog_aliases_remain_deterministic(self):
+        cases = {
+            "geri dön": {"action": "LAND_HOME"},
+            "başlangıç noktasına dön": {"action": "LAND_HOME"},
+            "sağa geç": {"action": "MISSING_INFO", "target_action": "MOVE_DIRECTION", "direction": "RIGHT", "missing_field": "distance_m"},
+            "yukarı çek": {"action": "MISSING_INFO", "target_action": "MOVE_VERTICAL", "direction": "UP", "missing_field": "distance_m"},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                payload = json.loads(parse_command(text))
+                self.assertFalse(payload["llm_called"])
+                for field, value in expected.items():
+                    self.assertEqual(value, payload["drone_command"].get(field), field)
+
+    def test_recovery_does_not_cross_critical_slots_or_damage_coordinates(self):
+        negatives = ("eve git", "sağa dön", "sağa git", "aşağı bak", "bugün hava çok güzel")
+        for text in negatives:
+            with self.subTest(text=text):
+                _, diagnostics = parse_drone_command_with_diagnostics(text)
+                self.assertFalse(diagnostics["correction_applied"])
+
+        left, left_diagnostics = parse_drone_command_with_diagnostics("sola gti")
+        self.assertNotEqual("RIGHT", left.get("direction"))
+        self.assertFalse(left_diagnostics["correction_applied"])
+        up, up_diagnostics = parse_drone_command_with_diagnostics("yukarı bk")
+        self.assertNotEqual("DOWN", up.get("direction"))
+        self.assertFalse(up_diagnostics["correction_applied"])
+
+        coordinate, diagnostics = parse_drone_command_with_diagnostics("39.9208, 32.8541 konumuna git")
+        self.assertEqual({"lat": 39.9208, "lon": 32.8541}, coordinate["coordinate"])
+        self.assertEqual("39.9208, 32.8541 konumuna git", diagnostics["normalized_suffix"])
+
+    def test_auto_apply_adversarial_pairs_never_cross_actions_or_slots(self):
+        cases = {
+            "sağa git": ("MOVE_DIRECTION", {"direction": "RIGHT"}),
+            "sağa dön": ("TURN", {"turn_direction": "RIGHT"}),
+            "sola git": ("MOVE_DIRECTION", {"direction": "LEFT"}),
+            "sola dön": ("TURN", {"turn_direction": "LEFT"}),
+            "dur": ("STOP", {}),
+            "uç": ("TAKE_OFF", {}),
+            "in": ("LAND_HOME", {}),
+            "bin": ("UNKNOWN", {}),
+            "bul": ("FIND_OBJECT", {}),
+            "izle": ("TRACK_OBJECT", {}),
+            "gizle": ("UNKNOWN", {}),
+            "ileri git": ("MOVE_DIRECTION", {"direction": "FORWARD"}),
+            "geri git": ("MOVE_DIRECTION", {"direction": "BACKWARD"}),
+            "yukarı çık": ("MOVE_VERTICAL", {"direction": "UP"}),
+            "aşağı in": ("MOVE_VERTICAL", {"direction": "DOWN"}),
+        }
+        for text, (intended_action, slots) in cases.items():
+            with self.subTest(text=text):
+                command, diagnostics = parse_drone_command_with_diagnostics(text)
+                action = command.get("target_action") if command.get("action") == "MISSING_INFO" else command.get("action")
+                self.assertEqual(intended_action, action)
+                self.assertFalse(diagnostics["correction_applied"])
+                for field, expected in slots.items():
+                    self.assertEqual(expected, command.get(field), field)
+
+        # Explicit slot evidence may result in no recovery or confirmation, but
+        # never in an opposite auto-applied slot.
+        for text, forbidden_field, forbidden_value in (
+            ("sağa gti", "direction", "LEFT"),
+            ("sola gti", "direction", "RIGHT"),
+            ("yukarı bk", "direction", "DOWN"),
+            ("aşağı bk", "direction", "UP"),
+        ):
+            with self.subTest(text=text):
+                command, diagnostics = parse_drone_command_with_diagnostics(text)
+                self.assertFalse(diagnostics["correction_applied"])
+                self.assertNotEqual(forbidden_value, command.get(forbidden_field))
+
+    def test_known_recovery_inputs_are_not_stopped_as_out_of_domain(self):
+        cases = {
+            "ev edin": ("LAND_HOME", "RESOLVED_AUTO_CORRECTION"),
+            "alço": ("MOVE_VERTICAL", "MISSING_INFO"),
+            "ikim etre sağa git": ("MOVE_DIRECTION", "RESOLVED_AUTO_CORRECTION"),
+        }
+        for text, (expected_action, expected_recovery_status) in cases.items():
+            with self.subTest(text=text):
+                command, diagnostics = parse_drone_command_with_diagnostics(text)
+                action = command.get("target_action") if command.get("action") == "MISSING_INFO" else command.get("action")
+                self.assertEqual(expected_action, action)
+                self.assertTrue(diagnostics["correction_applied"])
+                self.assertNotEqual("OUT_OF_DOMAIN", diagnostics["resolution_status"])
+                self.assertEqual(expected_recovery_status, diagnostics["recovery_resolution_status"])
+
+    def test_action_evidence_gate_rejects_hallucinated_missing_info(self):
+        payload = json.loads(parse_command("sadın"))
+        hints = payload["baseline_hints"]
+        self.assertEqual("UNKNOWN", payload["public_command"]["action"])
+        self.assertEqual("OUT_OF_DOMAIN", payload["resolution_status"])
+        self.assertFalse(payload["llm_called"])
+        self.assertFalse(hints["action_evidence"]["has_any"])
+        self.assertEqual([], hints["evidence_supported_actions"])
+        self.assertIsNone(payload["public_command"]["target_action"])
+        self.assertIsNone(payload["public_command"]["missing_field"])
+        self.assertLessEqual(payload["public_command"]["confidence"], 0.35)
+
+        rejected = json.loads(validate_llm_command(
+            json.dumps({"action": "MOVE_DIRECTION"}),
+            json.dumps({"original_command": "sadın"}),
+        ))
+        self.assertEqual("UNKNOWN", rejected["public_command"]["action"])
+        self.assertIsNone(rejected["public_command"]["target_action"])
+        self.assertIsNone(rejected["public_command"]["missing_field"])
+
+        compound, diagnostics = parse_drone_command_with_diagnostics("sağa dön ve ilerle")
+        self.assertEqual("UNKNOWN", compound["action"])
+        self.assertTrue(diagnostics["action_evidence"]["has_any"])
+        self.assertIn("TURN", diagnostics["evidence_supported_actions"])
+        self.assertIn("MOVE_DIRECTION", diagnostics["evidence_supported_actions"])
+
+    def test_multiple_close_candidates_require_confirmation_and_never_emit_command(self):
+        payload = json.loads(parse_command(
+            "sağa de",
+            json.dumps({"recovery_request_key": "request-a"}),
+        ))
+        hints = payload["baseline_hints"]
+        self.assertEqual("NEEDS_CONFIRMATION", payload["resolution_status"])
+        self.assertEqual("NEEDS_CONFIRMATION", hints["recovery_resolution_status"])
+        self.assertFalse(hints["correction_applied"])
+        self.assertGreaterEqual(len(hints["suggestions"]), 2)
+        self.assertEqual("UNKNOWN", payload["drone_command"]["action"])
+        self.assertFalse(payload["llm_called"])
+        self.assertEqual(len(hints["suggestions"]), len({item["suggestion_id"] for item in hints["suggestions"]}))
+
+    def test_confirmed_suggestion_is_reparsed_and_validated(self):
+        payload = json.loads(parse_command(
+            "bekl",
+            json.dumps({"recovery_request_key": "request-confirm"}),
+        ))
+        suggestions = payload["baseline_hints"]["suggestions"]
+        self.assertEqual(1, len(suggestions))
+        confirmed = json.loads(parse_command(suggestions[0]["suggested_command"]))
+        self.assertEqual("STOP", confirmed["public_command"]["action"])
+        self.assertFalse(confirmed["llm_called"])
+
+    def test_recovery_metadata_stays_out_of_public_command(self):
+        payload = json.loads(parse_command("ev edin"))
+        self.assertEqual(PUBLIC_FIELDS, list(payload["public_command"]))
+        self.assertNotIn("corrected_suffix", payload["public_command"])
+        self.assertNotIn("suggestions", payload["public_command"])
+        self.assertTrue(payload["baseline_hints"]["correction_applied"])
+
     def test_binding_contract_sentence_matrix(self):
         cases = [
             # TAKE_OFF / landing
@@ -365,7 +556,7 @@ class DroneCommandTests(unittest.TestCase):
             ("Kartal saat yönünün tersine 45 derece dön", "RESOLVED", {"action": "TURN", "turn_direction": "COUNTER_CLOCKWISE", "angle_deg": 45}),
             ("Kartal 30 derece sağa dön", "RESOLVED", {"action": "TURN", "turn_direction": "RIGHT", "angle_deg": 30}),
             ("Kartal 60 derece sola dön", "RESOLVED", {"action": "TURN", "turn_direction": "LEFT", "angle_deg": 60}),
-            ("Kartal sağa dön", "RESOLVED", {"action": "TURN", "turn_direction": "RIGHT"}),
+            ("Kartal sağa dön", "MISSING_USER_INFO", {"action": "MISSING_INFO", "turn_direction": "RIGHT", "target_action": "TURN", "missing_field": "angle_deg"}),
             # Objects
             ("Kartal tırı bul", "RESOLVED", {"action": "FIND_OBJECT", "object": "SEMI_TRUCK"}),
             ("Kartal kamyonu bul", "RESOLVED", {"action": "FIND_OBJECT", "object": "TRUCK"}),

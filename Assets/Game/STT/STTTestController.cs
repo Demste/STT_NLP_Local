@@ -47,6 +47,9 @@ namespace Game.STT
         [SerializeField] private TMP_Text filePathText;
         [SerializeField] private TMP_Dropdown providerDropdown;
 
+        [Header("Command Recovery UI")]
+        [SerializeField] private SpeechCommandRecoveryView commandRecoveryView;
+
         private readonly STTProvider _activeProvider = STTProvider.WhisperCppOffline;
         private MicrophoneRecorder _recorder;
         private STTSessionStorage _storage;
@@ -62,8 +65,13 @@ namespace Game.STT
         private bool _pendingCompleted;
         private STTResult _pendingResult;
         private CancellationTokenSource _pipelineCancellation;
+        private CancellationTokenSource _confirmationCancellation;
         private int _requestSequence;
         private int _activeRequestId;
+        private int _uiGeneration;
+        private bool _confirmationInProgress;
+        private string _lastCleanCommand = string.Empty;
+        private ModelWarmupCoordinator _warmupCoordinator;
         private readonly Dictionary<int, RequestTiming> _requestTimings = new Dictionary<int, RequestTiming>();
 
         private void Awake()
@@ -71,6 +79,7 @@ namespace Game.STT
             _recorder = new MicrophoneRecorder(sampleRate, maxRecordSeconds);
             _storage = new STTSessionStorage(language);
             _bridgeClient = new STTAndroidBridgeClient();
+            _warmupCoordinator = ModelWarmupCoordinator.Shared;
 
             SetupDropdown();
 
@@ -79,11 +88,60 @@ namespace Game.STT
                 shareTxtButton.onClick.AddListener(ShareTxt);
             }
 
-            SetStatus("Hazır");
+            SetStatus("Modeller hazırlanıyor...");
+            SetRecordButtonInteractable(false);
             SetWhisperResult(string.Empty);
             SetNlpJsonResult(string.Empty);
             SetTimingText(RequestTiming.Empty, 0);
             SetFilesText();
+        }
+
+        private void OnEnable()
+        {
+            _warmupCoordinator ??= ModelWarmupCoordinator.Shared;
+            _warmupCoordinator.ProgressChanged += HandleWarmupProgress;
+            if (commandRecoveryView != null)
+            {
+                commandRecoveryView.SuggestionSelected += ConfirmSuggestion;
+                commandRecoveryView.SuggestionRejected += RejectSuggestion;
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (_warmupCoordinator != null)
+            {
+                _warmupCoordinator.ProgressChanged -= HandleWarmupProgress;
+            }
+            if (commandRecoveryView != null)
+            {
+                commandRecoveryView.SuggestionSelected -= ConfirmSuggestion;
+                commandRecoveryView.SuggestionRejected -= RejectSuggestion;
+            }
+
+            CancelConfirmation();
+            _pipelineCancellation?.Cancel();
+        }
+
+        private async void Start()
+        {
+            try
+            {
+                ModelWarmupSnapshot result = await _warmupCoordinator.EnsureReadyAsync(
+                    speechCommandPipeline != null ? speechCommandPipeline.ActiveConfigJson : SpeechCommandPipelineConfig.DefaultConfigJson);
+                if (this != null && isActiveAndEnabled)
+                {
+                    HandleWarmupProgress(result);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (this != null && isActiveAndEnabled)
+                {
+                    SetStatus("Model hazırlama başarısız: " + ex.Message);
+                    SetRecordButtonInteractable(false);
+                }
+            }
         }
 
         private void OnDestroy()
@@ -95,6 +153,8 @@ namespace Game.STT
 
             _pipelineCancellation?.Cancel();
             _pipelineCancellation?.Dispose();
+            _confirmationCancellation?.Cancel();
+            _confirmationCancellation?.Dispose();
         }
 
         private void OnApplicationQuit()
@@ -121,6 +181,20 @@ namespace Game.STT
 
         public void BeginHoldRecording()
         {
+            ModelWarmupSnapshot warmup = _warmupCoordinator?.Snapshot;
+            if (warmup == null || !warmup.CanRecord)
+            {
+                if (warmup != null && warmup.state == ModelWarmupState.Failed)
+                {
+                    SetStatus("Model hazırlama başarısız: " + FirstNonEmpty(warmup.failureMessage, warmup.failureComponent));
+                }
+                else
+                {
+                    SetStatus("Modeller hazırlanıyor, lütfen bekleyin.");
+                }
+                return;
+            }
+
             if (_busy)
             {
                 SetStatus("Şu an işlem devam ediyor, bitince tekrar dene.");
@@ -335,6 +409,11 @@ namespace Game.STT
             _pipelineCancellation.CancelAfter(TimeSpan.FromSeconds(PipelineTimeoutSeconds));
 
             Debug.Log($"[STT] request_id={requestId} nlp_input={cleanCommand}");
+            ModelWarmupSnapshot warmup = _warmupCoordinator?.Snapshot;
+            Debug.Log(
+                $"[NLP] python_preinitialized={(warmup != null && warmup.pythonReady).ToString().ToLowerInvariant()} "
+                + $"spacy_model_reused={(warmup != null && warmup.spacyReady).ToString().ToLowerInvariant()} "
+                + $"llm_preinitialized={(warmup != null && warmup.llmReady).ToString().ToLowerInvariant()}");
             SetStatus("NLP’ye gönderiliyor", requestId);
             SetNlpJsonResult("NLP input: " + cleanCommand, requestId);
 
@@ -387,13 +466,12 @@ namespace Game.STT
             }
 
             SpeechCommandPipelineResult pipelineResult = pipelineTask.Result;
-            string uiJson = BuildNlpJsonResult(cleanCommand, pipelineResult);
+            _lastCleanCommand = cleanCommand;
+            string uiJson = RenderPipelineResult(cleanCommand, pipelineResult, requestId);
             Debug.Log($"[UI] request_id={requestId} writing_result={SummarizeForLog(uiJson)}");
             CompleteTotalTiming(timing, "NLP sonucu alındı");
             SetTimingText(timing, requestId);
             LogTotalDuration(requestId, timing.totalSeconds, timing.finalStatus);
-            SetStatus("NLP sonucu alındı", requestId);
-            SetNlpJsonResult(uiJson, requestId);
         }
 
         // Android Java bridge UnityPlayer.UnitySendMessage ile burayı çağırır.
@@ -717,6 +795,10 @@ namespace Game.STT
         private int StartNewRequest()
         {
             _pipelineCancellation?.Cancel();
+            CancelConfirmation();
+            speechCommandPipeline?.ResetSuggestions();
+            commandRecoveryView?.ClearForNewTranscript();
+            _uiGeneration++;
             _activeRequestId = ++_requestSequence;
             _pendingCompleted = false;
             _pendingResult = null;
@@ -803,7 +885,44 @@ namespace Game.STT
         {
             if (recordButton != null)
             {
-                recordButton.interactable = interactable;
+                bool modelsReady = _warmupCoordinator == null || _warmupCoordinator.Snapshot.CanRecord;
+                recordButton.interactable = interactable && modelsReady;
+            }
+        }
+
+        private void HandleWarmupProgress(ModelWarmupSnapshot warmup)
+        {
+            if (warmup == null || !isActiveAndEnabled)
+            {
+                return;
+            }
+
+            switch (warmup.state)
+            {
+                case ModelWarmupState.WarmingUp:
+                    string component = warmup.currentComponent switch
+                    {
+                        "whisper" => "Whisper",
+                        "python_spacy" => "NLP",
+                        "llm" => "LLM",
+                        _ => "modeller",
+                    };
+                    SetStatus("Modeller hazırlanıyor: " + component);
+                    break;
+                case ModelWarmupState.Ready:
+                    SetStatus("Sistem hazır");
+                    break;
+                case ModelWarmupState.PartiallyReady:
+                    SetStatus("Sistem kısmen hazır: " + FirstNonEmpty(warmup.failureComponent, "LLM"));
+                    break;
+                case ModelWarmupState.Failed:
+                    SetStatus("Model hazırlama başarısız: " + FirstNonEmpty(warmup.failureMessage, warmup.failureComponent));
+                    break;
+            }
+
+            if (recordButton != null)
+            {
+                recordButton.interactable = warmup.CanRecord && !_busy;
             }
         }
 
@@ -824,9 +943,136 @@ namespace Game.STT
         private static string BuildNlpJsonResult(string cleanCommand, SpeechCommandPipelineResult result)
         {
             ValidatedCommandResult command = result != null ? result.validated : null;
-            return result != null && !string.IsNullOrWhiteSpace(result.finalJson)
-                ? result.finalJson
-                : DroneCommandJsonParser.ToPublicJson(command);
+            if (result != null && !string.IsNullOrWhiteSpace(result.finalJson))
+            {
+                return result.finalJson;
+            }
+
+            return command != null ? DroneCommandJsonParser.ToPublicJson(command) : string.Empty;
+        }
+
+        private string RenderPipelineResult(string cleanCommand, SpeechCommandPipelineResult result, int requestId)
+        {
+            if (!IsLatestRequest(requestId))
+            {
+                return string.Empty;
+            }
+
+            commandRecoveryView?.Render(result);
+            bool needsConfirmation = string.Equals(
+                result?.recovery?.resolution_status,
+                CommandRecoveryStatus.NeedsConfirmation,
+                StringComparison.Ordinal);
+            string uiJson = needsConfirmation ? string.Empty : BuildNlpJsonResult(cleanCommand, result);
+            SetNlpJsonResult(uiJson, requestId);
+
+            if (needsConfirmation)
+            {
+                SetStatus("Komut onayı gerekiyor", requestId);
+            }
+            else if (string.Equals(result?.validated?.action, "MISSING_INFO", StringComparison.Ordinal))
+            {
+                SetStatus(FirstNonEmpty(result.validated.missing_message, "Komut için ek bilgi gerekiyor."), requestId);
+            }
+            else if (string.Equals(result?.validated?.action, "UNKNOWN", StringComparison.Ordinal))
+            {
+                SetStatus("Komut anlaşılamadı. Lütfen tekrar söyleyin.", requestId);
+            }
+            else
+            {
+                SetStatus("NLP sonucu alındı", requestId);
+            }
+
+            return uiJson;
+        }
+
+        private async void ConfirmSuggestion(string suggestionId)
+        {
+            if (_confirmationInProgress || speechCommandPipeline == null || string.IsNullOrWhiteSpace(suggestionId))
+            {
+                return;
+            }
+
+            int requestId = _activeRequestId;
+            int generation = _uiGeneration;
+            _confirmationInProgress = true;
+            _confirmationCancellation?.Cancel();
+            _confirmationCancellation?.Dispose();
+            _confirmationCancellation = new CancellationTokenSource();
+            _confirmationCancellation.CancelAfter(TimeSpan.FromSeconds(PipelineTimeoutSeconds));
+            commandRecoveryView?.SetConfirmationBusy(true);
+
+            try
+            {
+                SuggestionDecisionResult decision = await speechCommandPipeline.ConfirmSuggestionAsync(
+                    suggestionId,
+                    _confirmationCancellation.Token);
+
+                if (!isActiveAndEnabled || generation != _uiGeneration || !IsLatestRequest(requestId))
+                {
+                    return;
+                }
+
+                if (decision != null && decision.accepted && decision.pipeline_result != null)
+                {
+                    RenderPipelineResult(_lastCleanCommand, decision.pipeline_result, requestId);
+                    return;
+                }
+
+                SetNlpJsonResult(string.Empty, requestId);
+                SetStatus("Önerinin süresi doldu; komutu tekrar söyleyin.", requestId);
+                commandRecoveryView?.ShowDecisionFailure(decision?.message);
+            }
+            catch (OperationCanceledException)
+            {
+                // Yeni kayıt, disable veya timeout bu akışı normal şekilde sonlandırır.
+            }
+            catch (Exception ex)
+            {
+                if (isActiveAndEnabled && generation == _uiGeneration && IsLatestRequest(requestId))
+                {
+                    SetNlpJsonResult(string.Empty, requestId);
+                    SetStatus("Öneri doğrulanamadı.", requestId);
+                    commandRecoveryView?.ShowDecisionFailure("Öneri doğrulanamadı; komutu tekrar söyleyin.");
+                    Debug.LogException(ex);
+                }
+            }
+            finally
+            {
+                if (generation == _uiGeneration && IsLatestRequest(requestId))
+                {
+                    _confirmationInProgress = false;
+                    commandRecoveryView?.SetConfirmationBusy(false);
+                }
+            }
+        }
+
+        private void RejectSuggestion(string suggestionId)
+        {
+            if (_confirmationInProgress || speechCommandPipeline == null || string.IsNullOrWhiteSpace(suggestionId))
+            {
+                return;
+            }
+
+            SuggestionDecisionResult decision = speechCommandPipeline.RejectSuggestion(suggestionId);
+            SetNlpJsonResult(string.Empty, _activeRequestId);
+            if (decision != null && string.Equals(decision.resolution_status, CommandRecoveryStatus.Rejected, StringComparison.Ordinal))
+            {
+                SetStatus("Öneri reddedildi; komutu tekrar söyleyin.", _activeRequestId);
+                commandRecoveryView?.ShowRejected(decision.message);
+            }
+            else
+            {
+                SetStatus("Önerinin süresi doldu; komutu tekrar söyleyin.", _activeRequestId);
+                commandRecoveryView?.ShowDecisionFailure(decision?.message);
+            }
+        }
+
+        private void CancelConfirmation()
+        {
+            _confirmationCancellation?.Cancel();
+            _confirmationInProgress = false;
+            commandRecoveryView?.SetConfirmationBusy(false);
         }
 
         private RequestTiming GetTiming(int requestId)

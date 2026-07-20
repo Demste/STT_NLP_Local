@@ -68,6 +68,38 @@ namespace Game.NLP.Android
 #endif
         }
 
+        public static Task<string> WarmUpAsync(CancellationToken cancellationToken = default)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                AndroidJNI.AttachCurrentThread();
+                try
+                {
+                    using AndroidJavaClass unityPlayer = new AndroidJavaClass(UnityPlayerClassName);
+                    using AndroidJavaObject activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
+                    if (activity == null)
+                    {
+                        return BuildUnavailableJson(string.Empty, "android_activity_null", "real_spacy", "UnityPlayer.currentActivity is null.");
+                    }
+                    using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+                    string result = bridge.CallStatic<string>("warmUp", activity);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return string.IsNullOrEmpty(result)
+                        ? BuildUnavailableJson(string.Empty, "android_bridge_returned_empty", "real_spacy", "Android Python/spaCy warm-up returned empty.")
+                        : result;
+                }
+                finally
+                {
+                    AndroidJNI.DetachCurrentThread();
+                }
+            }, cancellationToken);
+#else
+            return Task.FromResult("{\"ok\":true,\"stage\":\"editor_noop\",\"python_preinitialized\":true,\"spacy_model_reused\":true,\"durationMs\":0}");
+#endif
+        }
+
         private static string BuildUnavailableJson(string text, string stage, string engine, string error)
         {
             return "{"
@@ -98,4 +130,3 @@ namespace Game.NLP.Android
         }
     }
 }
-

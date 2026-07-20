@@ -13,7 +13,7 @@ import time
 import traceback
 from typing import Any, Dict, Optional
 
-from nlp_pipeline.baseline_rules import build_baseline_hints, parse_drone_command
+from nlp_pipeline.baseline_rules import build_baseline_hints, parse_drone_command, parse_drone_command_with_diagnostics
 from nlp_pipeline.command_validation import materialize_public_command, validate_command
 from nlp_pipeline.spacy_analysis import build_analysis, build_compact_evidence
 from nlp_pipeline.text_normalization import normalize_turkish, repair_common_mojibake
@@ -25,6 +25,26 @@ _nlp = None
 _load_error: Optional[Dict[str, Any]] = None
 
 
+def warm_up() -> str:
+    """Import and cache the vendored spaCy model without running inference."""
+    started = time.perf_counter()
+    reused = _nlp is not None
+    try:
+        _get_nlp()
+        return _json_dumps({
+            "ok": True,
+            "stage": "python_spacy_warmed",
+            "python_preinitialized": True,
+            "spacy_model_reused": reused,
+            "model": MODEL_NAME,
+            "durationMs": round((time.perf_counter() - started) * 1000.0, 3),
+        })
+    except Exception as exc:
+        payload = _error_payload("", "", "python_spacy_warm_up_failed", exc)
+        payload["durationMs"] = round((time.perf_counter() - started) * 1000.0, 3)
+        return _json_dumps(payload)
+
+
 def parse_command(text: str, context_json: str = "") -> str:
     """Analyze Turkish text with the vendored spaCy model and return JSON."""
     wake_word_suffix = text if text is not None else ""
@@ -34,7 +54,8 @@ def parse_command(text: str, context_json: str = "") -> str:
 
     # Deterministic action/slot extraction is deliberately before spaCy model
     # loading. Clear commands therefore pay neither spaCy nor LLM inference cost.
-    baseline_hints = build_baseline_hints({}, analysis_text)
+    recovery_request_key = context.get("recovery_request_key") if isinstance(context.get("recovery_request_key"), str) else ""
+    baseline_hints = build_baseline_hints({}, analysis_text, request_key=recovery_request_key)
     analysis_text = baseline_hints.get("analysis_input") or analysis_text
     if baseline_hints["final_parser"]:
         internal_command = baseline_hints["command_candidate"]
@@ -166,14 +187,18 @@ def validate_llm_command(command_json: str, context_json: str = "") -> str:
     action = str(command.get("action") or "UNKNOWN").strip().upper() if isinstance(command, dict) else "UNKNOWN"
     context = _context_dict(context_json)
     original = context.get("original_command") or context.get("input") or context.get("normalized_command") or ""
-    evidence = parse_drone_command(original) if isinstance(original, str) and original.strip() else {"action": "UNKNOWN", "confidence": 0.0}
+    if isinstance(original, str) and original.strip():
+        evidence, evidence_metrics = parse_drone_command_with_diagnostics(original)
+    else:
+        evidence, evidence_metrics = {"action": "UNKNOWN", "confidence": 0.0}, {"evidence_supported_actions": []}
     evidence_action = evidence.get("target_action") if evidence.get("action") == "MISSING_INFO" else evidence.get("action")
+    supported_actions = evidence_metrics.get("evidence_supported_actions") or []
     if action == evidence_action:
         candidate = dict(evidence)
+    elif action in supported_actions:
+        candidate = {"action": action, "confidence": 0.76}
     else:
-        # The LLM classifies intent only. Its confidence and slot fields are
-        # deliberately ignored when deterministic evidence is unavailable.
-        candidate = {"action": action, "confidence": 0.0 if action == "UNKNOWN" else 0.76}
+        candidate = {"action": "UNKNOWN", "confidence": 0.0}
     diagnostics = {}
     validated = validate_command(candidate, context_json, diagnostics)
     public = materialize_public_command(validated)

@@ -150,6 +150,48 @@ namespace Game.NLP
         public double action_resolution_duration_ms;
         public double slot_extraction_duration_ms;
         public double validation_duration_ms;
+        public string original_suffix;
+        public string normalized_suffix;
+        public string corrected_suffix;
+        public bool correction_applied;
+        public double correction_confidence;
+        public string correction_reason;
+        public string candidate_action;
+        public int candidate_count;
+        public double candidate_gap;
+        public string recovery_resolution_status;
+        public CommandSuggestion[] suggestions;
+        public string parser_input;
+        public string parser_source;
+        public ActionEvidenceSummary action_evidence;
+        public string[] evidence_supported_actions;
+    }
+
+    [Serializable]
+    public sealed class ActionEvidenceSummary
+    {
+        public bool has_any;
+        public string[] supported_actions;
+        public string[] reasons;
+        public string source_text;
+
+        public bool Supports(string action)
+        {
+            if (string.IsNullOrWhiteSpace(action) || supported_actions == null)
+            {
+                return false;
+            }
+
+            foreach (string supported in supported_actions)
+            {
+                if (string.Equals(supported, action, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     [Serializable]

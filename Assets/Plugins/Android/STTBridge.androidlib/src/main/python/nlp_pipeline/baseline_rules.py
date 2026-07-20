@@ -7,38 +7,33 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .command_catalog import (
+    COLOR_ALIASES,
+    NUMBER_WORDS,
+    OBJECT_ALIASES,
+    RECOVERY_AUTO_APPLY_GAP,
+    RECOVERY_AUTO_APPLY_SCORE,
+    RECOVERY_CONFIRM_SCORE,
+    RECOVERY_MAX_SUGGESTIONS,
+    SHAPE_ALIASES,
+)
+from .command_recovery import build_recovery_candidates, make_suggestion
 from .command_text_repair import build_repair_candidates
 from .command_validation import validate_command
 from .text_normalization import normalize_turkish_text
 
-OBJECTS = {
-    "beton mikseri": "CEMENT_TRUCK", "beton mikser": "CEMENT_TRUCK",
-    "cimento kamyon": "CEMENT_TRUCK", "mikser kamyon": "CEMENT_TRUCK",
-    "dorseli tir": "SEMI_TRUCK", "cekici tir": "SEMI_TRUCK",
-    "kazi makinesi": "EXCAVATOR", "kazi makine": "EXCAVATOR",
-    "yukleme makinesi": "LOADER", "yukleme makine": "LOADER",
-    "kamyonet": "PICKUP", "pickup": "PICKUP", "pikap": "PICKUP", "pikabi": "PICKUP",
-    "otomobil": "CAR", "araba": "CAR", "arac": "CAR",
-    "ekskavator": "EXCAVATOR", "kazici": "EXCAVATOR", "kepce": "EXCAVATOR",
-    "yukleyici": "LOADER", "loader": "LOADER", "forklift": "FORKLIFT", "kamyon": "TRUCK",
-    "tir": "SEMI_TRUCK", "cekici": "SEMI_TRUCK", "vinc": "CRANE", "crane": "CRANE",
-}
-COLORS = {"kirmizi": "RED", "yesil": "GREEN", "mavi": "BLUE", "beyaz": "WHITE", "siyah": "BLACK"}
-SHAPES = {"cizgi": "LINE", "hat": "LINE", "kare": "SQUARE", "ucgen": "TRIANGLE", "arti": "PLUS", "plus": "PLUS"}
-NUMBER_WORDS = {
-    "sifir": 0, "bir": 1, "iki": 2, "uc": 3, "dort": 4, "bes": 5, "alti": 6,
-    "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10, "yirmi": 20, "otuz": 30,
-    "kirk": 40, "elli": 50, "altmis": 60, "yetmis": 70, "seksen": 80, "doksan": 90,
-}
+OBJECTS = OBJECT_ALIASES
+COLORS = COLOR_ALIASES
+SHAPES = SHAPE_ALIASES
 NUMBER_WORD_PATTERN = "(?:" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True)) + "|yuz)"
 
 
-def build_baseline_hints(analysis: Dict[str, Any], original_text: str = "") -> Dict[str, Any]:
+def build_baseline_hints(analysis: Dict[str, Any], original_text: str = "", request_key: str = "") -> Dict[str, Any]:
     text = original_text or " ".join(str(token.get("text", "")) for token in analysis.get("tokens", []))
-    command, metrics = parse_drone_command_with_diagnostics(text)
+    command, metrics = parse_drone_command_with_diagnostics(text, request_key=request_key)
     intended_action = command.get("target_action") if command.get("action") == "MISSING_INFO" else command.get("action")
     resolution_status = metrics["resolution_status"]
-    final_parser = resolution_status in ("RESOLVED", "MISSING_USER_INFO", "OUT_OF_DOMAIN")
+    final_parser = resolution_status in ("RESOLVED", "MISSING_USER_INFO", "OUT_OF_DOMAIN", "NEEDS_CONFIRMATION")
     return {
         "final_parser": final_parser,
         "resolution_status": resolution_status,
@@ -61,6 +56,8 @@ def build_baseline_hints(analysis: Dict[str, Any], original_text: str = "") -> D
         "location_candidates": _one(command.get("location_keyword")),
         "coordinate_candidates": _one(command.get("coordinate")),
         "observe_mode_candidates": _one(command.get("observe_mode")),
+        "action_evidence": metrics.get("action_evidence", _empty_action_evidence()),
+        "evidence_supported_actions": metrics.get("evidence_supported_actions", []),
         **metrics,
     }
 
@@ -69,7 +66,7 @@ def parse_drone_command(text: str) -> Dict[str, Any]:
     return parse_drone_command_with_diagnostics(text)[0]
 
 
-def parse_drone_command_with_diagnostics(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def parse_drone_command_with_diagnostics(text: str, request_key: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     started = time.perf_counter()
     raw = text or ""
     repair = build_repair_candidates(raw)
@@ -83,6 +80,23 @@ def parse_drone_command_with_diagnostics(text: str) -> Tuple[Dict[str, Any], Dic
         key=lambda item: (_resolution_score(item[2]["resolution_status"]), 1 if item[1].get("object") else 0),
     )
     original_text = repair["repair_candidates"][0] if repair["repair_candidates"] else raw
+    original_suffix = _strip_wake_word(original_text)
+    normalized_suffix = _phrase(original_suffix).strip(".,;:!? ")
+
+    recovery = _resolve_recovery(
+        original_suffix,
+        command,
+        selected_metrics,
+        request_key,
+    )
+    if recovery["decision"] == "auto":
+        selected_text = recovery["corrected_suffix"]
+        command = recovery["command"]
+        selected_metrics = recovery["metrics"]
+    elif recovery["decision"] == "confirmation":
+        command = {"action": "UNKNOWN", "confidence": 0.0}
+        selected_metrics["resolution_status"] = "NEEDS_CONFIRMATION"
+
     selected_metrics.update({
         "raw_input": raw,
         "wake_word_suffix": original_text,
@@ -93,8 +107,225 @@ def parse_drone_command_with_diagnostics(text: str) -> Tuple[Dict[str, Any], Dic
         "repair_notes": repair["repair_notes"] if selected_text != original_text else [],
         "repair_duration_ms": repair["repair_duration_ms"],
         "baseline_duration_ms": _elapsed_ms(started),
+        "original_suffix": original_suffix,
+        "normalized_suffix": normalized_suffix,
+        "corrected_suffix": recovery.get("corrected_suffix", ""),
+        "correction_applied": recovery["decision"] == "auto",
+        "correction_confidence": recovery.get("confidence", 0.0),
+        "correction_reason": recovery.get("reason", "NONE"),
+        "candidate_action": recovery.get("candidate_action", ""),
+        "candidate_count": recovery.get("candidate_count", 0),
+        "candidate_gap": recovery.get("candidate_gap", 0.0),
+        "recovery_resolution_status": recovery.get("resolution_status", "NO_RECOVERY"),
+        "suggestions": recovery.get("suggestions", []),
+        "parser_input": selected_text,
+        "parser_source": "deterministic_recovery" if recovery["decision"] == "auto" else "deterministic_original",
     })
+    action_evidence = evaluate_action_evidence(original_suffix, command, selected_metrics)
+    selected_metrics["action_evidence"] = action_evidence
+    selected_metrics["evidence_supported_actions"] = action_evidence["supported_actions"]
+    if (command.get("action") == "UNKNOWN"
+            and selected_metrics.get("resolution_status") == "NEEDS_ACTION_CLASSIFICATION"
+            and not action_evidence["has_any"]):
+        selected_metrics["resolution_status"] = "OUT_OF_DOMAIN"
+        selected_metrics["recovery_resolution_status"] = "UNKNOWN"
     return command, selected_metrics
+
+
+def evaluate_action_evidence(text: str, command: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the single authoritative action-evidence decision for downstream gates.
+
+    The LLM classification is deliberately absent from this function. Only the
+    transcript, deterministic command/slots and recovery candidates contribute.
+    """
+    phrase = _phrase(_strip_wake_word(text or "")).strip(".,;:!? ")
+    supported = set()
+    reasons: List[str] = []
+
+    intended = command.get("target_action") if command.get("action") == "MISSING_INFO" else command.get("action")
+    if intended and intended not in ("UNKNOWN", "MISSING_INFO"):
+        supported.add(str(intended))
+        reasons.append("deterministic_action:" + str(intended))
+
+    recovery_action = str(metrics.get("candidate_action") or "")
+    if metrics.get("candidate_count", 0) > 0 and recovery_action and recovery_action != "UNKNOWN":
+        supported.add(recovery_action)
+        reasons.append("recovery_candidate:" + recovery_action)
+    for suggestion in metrics.get("suggestions") or []:
+        action = str(suggestion.get("suggested_action") or "")
+        if action and action != "UNKNOWN":
+            supported.add(action)
+            reasons.append("recovery_suggestion:" + action)
+
+    obj = _mapped(phrase, OBJECTS)
+    color = _mapped(phrase, COLORS)
+    shape = _mapped(phrase, SHAPES)
+    has_move_verb = _has_any(phrase, "git", "gec", "ilerle", "hareket et")
+    has_turn_verb = _has_any(phrase, "don", "dondur", "cevir")
+    has_find_verb = _has_any(phrase, "bul", "ara", "tespit")
+    has_track_verb = _has_any(phrase, "takip et", "izle", "pesinden git")
+
+    if has_move_verb and (_direction(phrase) is not None or _quantity(phrase, r"metre|meter|m") is not None):
+        _add_evidence(supported, reasons, "MOVE_DIRECTION", "horizontal_movement_phrase")
+    elif has_move_verb and not _has_any(phrase, "nokta", "konum", "bolge", "koordinat"):
+        _add_evidence(supported, reasons, "MOVE_DIRECTION", "horizontal_movement_verb")
+
+    if has_turn_verb or _turn_direction(phrase) is not None:
+        _add_evidence(supported, reasons, "TURN", "turn_phrase")
+    if (_vertical_direction(phrase) is not None
+            or _has_any(phrase, "yuksel", "alcal", "yukari cik", "asagi in")):
+        _add_evidence(supported, reasons, "MOVE_VERTICAL", "vertical_phrase")
+    if _speed_quantity(phrase) is not None or _has_any(phrase, "hiz", "hizlan", "yavasla", "km/h", "kilometre saat"):
+        _add_evidence(supported, reasons, "SET_SPEED", "speed_phrase")
+
+    if has_find_verb and obj:
+        _add_evidence(supported, reasons, "FIND_OBJECT", "object_find_phrase")
+    elif _has_any(phrase, "bul", "ara", "tespit et") and not (color or shape or _has_inflected(phrase, "isaret")):
+        _add_evidence(supported, reasons, "FIND_OBJECT", "find_verb")
+    if has_track_verb:
+        _add_evidence(supported, reasons, "TRACK_OBJECT", "track_phrase")
+    if obj and _has_any(phrase, "ustunde", "uzerinde", "ustune", "uzerine") and _has_any(phrase, "dur", "bekle", "hover"):
+        _add_evidence(supported, reasons, "HOLD_OVER_OBJECT", "object_hold_phrase")
+    if (color or shape or _has_inflected(phrase, "isaret") or _has_any(phrase, "marker")) and has_find_verb:
+        _add_evidence(supported, reasons, "FIND_MARKER", "marker_find_phrase")
+
+    if ((_coordinate(phrase) is not None or _has_any(phrase, "nokta", "konum", "bolge", "koordinat", "oraya"))
+            and has_move_verb):
+        _add_evidence(supported, reasons, "GO_TO_LOCATION", "location_navigation_phrase")
+    if _has_any(phrase, "havada dur", "havada bekle", "hover", "havada sabit kal"):
+        _add_evidence(supported, reasons, "HOVER", "hover_phrase")
+    if _has_any(phrase, "bekle ve izle", "dur ve izle", "oldugun yerde izle", "burada izle"):
+        _add_evidence(supported, reasons, "OBSERVE_CURRENT", "observe_phrase")
+    if _has_any(phrase, "dur", "bekle", "sabit kal", "hareket etme", "hareketi kes"):
+        _add_evidence(supported, reasons, "STOP", "stop_phrase")
+
+    if _has_any(phrase, "havalan", "kalk", "ucusa gec", "ucus yap") or phrase == "uc":
+        _add_evidence(supported, reasons, "TAKE_OFF", "takeoff_phrase")
+    if _has_any(phrase, "bekleme noktasina in"):
+        _add_evidence(supported, reasons, "LAND_AT_WAIT_POINT", "wait_point_landing_phrase")
+    if _has_any(phrase, "oldugun yere in", "bulundugun yere in", "mevcut konuma in", "buraya in"):
+        _add_evidence(supported, reasons, "LAND_CURRENT", "current_location_landing_phrase")
+    if (_has_any(phrase, "eve don", "geri don", "baslangic noktasina don", "baslangic noktasina in")
+            or re.fullmatch(r"in[.,]*", phrase)):
+        _add_evidence(supported, reasons, "LAND_HOME", "home_landing_phrase")
+
+    ordered = sorted(supported)
+    return {
+        "has_any": bool(ordered),
+        "supported_actions": ordered,
+        "reasons": reasons,
+        "source_text": phrase,
+    }
+
+
+def _add_evidence(supported: set, reasons: List[str], action: str, reason: str) -> None:
+    supported.add(action)
+    reasons.append(reason + ":" + action)
+
+
+def _empty_action_evidence() -> Dict[str, Any]:
+    return {"has_any": False, "supported_actions": [], "reasons": [], "source_text": ""}
+
+
+def _resolve_recovery(
+    original_suffix: str,
+    original_command: Dict[str, Any],
+    original_metrics: Dict[str, Any],
+    request_key: str,
+) -> Dict[str, Any]:
+    original_status = original_metrics.get("resolution_status", "NEEDS_ACTION_CLASSIFICATION")
+    if original_status == "RESOLVED":
+        return _recovery_result("none", "RESOLVED_ORIGINAL")
+    if original_status == "OUT_OF_DOMAIN":
+        return _recovery_result("none", "UNKNOWN", reason="LOW_CONFIDENCE")
+
+    candidates = build_recovery_candidates(original_suffix, request_key)
+    # Missing user data may only use an explicit known/token repair; fuzzy
+    # matching cannot fabricate the absent required slot.
+    if original_status in ("MISSING_USER_INFO", "NEEDS_SLOT_CLASSIFICATION"):
+        candidates = [candidate for candidate in candidates if candidate.get("reason") in (
+            "KNOWN_STT_VARIANT", "TOKEN_REPAIR", "NUMBER_UNIT_REPAIR",
+        )]
+
+    evaluated = []
+    for candidate in candidates:
+        corrected = str(candidate.get("corrected_suffix") or "")
+        parsed_command, parsed_metrics = _parse_candidate(corrected)
+        parsed_status = parsed_metrics.get("resolution_status")
+        if parsed_status not in ("RESOLVED", "MISSING_USER_INFO"):
+            continue
+        action = parsed_command.get("target_action") if parsed_command.get("action") == "MISSING_INFO" else parsed_command.get("action")
+        item = dict(candidate)
+        item.update({"command": parsed_command, "metrics": parsed_metrics, "candidate_action": action or "UNKNOWN"})
+        evaluated.append(item)
+
+    evaluated.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+    viable = [item for item in evaluated if float(item.get("confidence") or 0.0) >= RECOVERY_CONFIRM_SCORE and not item.get("critical_conflict")]
+    if not viable:
+        reason = (
+            "VALIDATION_FAILED" if candidates and not evaluated
+            else "CRITICAL_SLOT_CONFLICT" if any(item.get("critical_conflict") for item in evaluated)
+            else "LOW_CONFIDENCE"
+        )
+        resolution = "UNKNOWN" if original_command.get("action") == "UNKNOWN" else "MISSING_INFO"
+        return _recovery_result("none", resolution, reason=reason)
+
+    best = viable[0]
+    second_score = float(viable[1].get("confidence") or 0.0) if len(viable) > 1 else 0.0
+    gap = round(float(best["confidence"]) - second_score, 4)
+    if (float(best["confidence"]) >= RECOVERY_AUTO_APPLY_SCORE
+            and gap >= RECOVERY_AUTO_APPLY_GAP
+            and not best.get("critical_conflict")):
+        return _recovery_result(
+            "auto",
+            "RESOLVED_AUTO_CORRECTION" if best["command"].get("action") != "MISSING_INFO" else "MISSING_INFO",
+            best=best,
+            candidate_count=len(viable),
+            candidate_gap=gap,
+        )
+
+    unique_actions = []
+    for item in viable:
+        if item["candidate_action"] not in unique_actions:
+            unique_actions.append(item["candidate_action"])
+    suggestion_items = []
+    for action in unique_actions[:RECOVERY_MAX_SUGGESTIONS]:
+        item = next(candidate for candidate in viable if candidate["candidate_action"] == action)
+        suggestion_items.append(make_suggestion(item, request_key, multiple=len(unique_actions) > 1))
+    return _recovery_result(
+        "confirmation",
+        "NEEDS_CONFIRMATION",
+        best=best,
+        candidate_count=len(viable),
+        candidate_gap=gap,
+        suggestions=suggestion_items,
+        reason="MULTIPLE_CLOSE_CANDIDATES" if len(unique_actions) > 1 else best.get("reason", "FUZZY_SINGLE_CANDIDATE"),
+    )
+
+
+def _recovery_result(
+    decision: str,
+    resolution_status: str,
+    best: Dict[str, Any] = None,
+    candidate_count: int = 0,
+    candidate_gap: float = 0.0,
+    suggestions: List[Dict[str, Any]] = None,
+    reason: str = "NONE",
+) -> Dict[str, Any]:
+    item = best or {}
+    return {
+        "decision": decision,
+        "resolution_status": resolution_status,
+        "corrected_suffix": str(item.get("corrected_suffix") or ""),
+        "confidence": float(item.get("confidence") or 0.0),
+        "reason": reason if reason != "NONE" else str(item.get("reason") or "NONE"),
+        "candidate_action": str(item.get("candidate_action") or ""),
+        "candidate_count": candidate_count,
+        "candidate_gap": candidate_gap,
+        "suggestions": suggestions or [],
+        "command": item.get("command"),
+        "metrics": item.get("metrics"),
+    }
 
 
 def _parse_candidate(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -163,13 +394,17 @@ def resolve_action(phrase: str) -> Tuple[str, float]:
         return "TURN", .96
     if _speed_quantity(phrase) is not None or _has_any(phrase, "hizli", "yavas", "hizlan", "hizini", "hizi", "hizla"):
         return "SET_SPEED", .95
-    if _vertical_direction(phrase) is not None and (_has_any(phrase, "yuksel", "yukari cik", "asagi in", "alcal") or _quantity(phrase, r"metre|meter|m") is not None):
+    if _vertical_direction(phrase) is not None and (_has_any(phrase, "yuksel", "yukari cik", "yukari cek", "asagi in", "alcal") or _quantity(phrase, r"metre|meter|m") is not None):
         return "MOVE_VERTICAL", .97 if _quantity(phrase, r"metre|meter|m") is not None else .94
-    if _direction(phrase) is not None and _has_any(phrase, "git", "ilerle", "hareket et"):
+    if _direction(phrase) is not None and _has_any(phrase, "git", "gec", "ilerle", "hareket et"):
         return "MOVE_DIRECTION", .96
     if (_coordinate(phrase) is not None and _has_any(phrase, "git", "konum")) or _has_any(phrase, "noktasina git", "bolgesine git", "konumuna git", "konuma git", "oraya git"):
         return "GO_TO_LOCATION", .98 if _coordinate(phrase) is not None else .92
-    if _has_any(phrase, "kalktigin yere in", "baslangic noktasina in", "eve don") or re.fullmatch(r"in[.,]*", phrase):
+    if _has_any(
+        phrase,
+        "kalktigin yere in", "baslangic noktasina in", "baslangic noktasina don",
+        "eve don", "geri don",
+    ) or re.fullmatch(r"in[.,]*", phrase):
         return "LAND_HOME", .98
     if _has(phrase, "havalan") or _has(phrase, "kalk") or phrase == "uc" or _has_any(phrase, "ucusa gec", "ucus yap"):
         return "TAKE_OFF", .98
@@ -251,6 +486,10 @@ def extract_marker(phrase: str) -> Dict[str, Any]:
 
 def _phrase(value: str) -> str:
     return normalize_turkish_text(value)
+
+
+def _strip_wake_word(value: str) -> str:
+    return re.sub(r"^\s*kartal\b[\s,;:.-]*", "", value or "", flags=re.IGNORECASE).strip()
 
 
 def _mapped(phrase: str, values: Dict[str, str]) -> Optional[str]:

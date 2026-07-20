@@ -36,6 +36,13 @@ public final class OfflineLlmBridge {
         try {
             if (context == null) throw new IllegalArgumentException("Context is null.");
             JSONObject config = LlmCommandSchema.mergeWithDefault(configJson);
+            String configKey = initializationConfigKey(config);
+            boolean modelReused;
+            synchronized (ENGINE_LOCK) {
+                modelReused = cachedEngine != null
+                        && cachedEngine.getStatus().initialized
+                        && configKey.equals(cachedEngineConfigKey);
+            }
             OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
             LlmBackendStatus status = engine.getStatus();
             JSONObject payload = new JSONObject();
@@ -43,6 +50,7 @@ public final class OfflineLlmBridge {
             payload.put("contract_version", CONTRACT_VERSION);
             payload.put("stage", status.initialized ? "model_warmed" : status.stage);
             payload.put("initialized", status.initialized);
+            payload.put("model_reused", modelReused);
             payload.put("inference_ran", false);
             payload.put("backend_status", status.toJson());
             payload.put("durationMs", System.currentTimeMillis() - started);
@@ -109,6 +117,15 @@ public final class OfflineLlmBridge {
 
             if (input.isEmpty()) {
                 return unknownJson(input, "empty_or_unclear_command", System.currentTimeMillis() - started, spacy);
+            }
+
+            if (!hasActionEvidence(spacy, baseline)) {
+                diagnostics.put("recovery_status", recoveryStatus(spacy));
+                diagnostics.put("final_resolution_status", "UNKNOWN");
+                diagnostics.put("action_llm_called", false);
+                diagnostics.put("slot_llm_called", false);
+                diagnostics.put("slot_evidence_valid", false);
+                return enrich(unknownJson(input, "action_evidence_absent", System.currentTimeMillis() - started, spacy), diagnostics);
             }
 
             OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
@@ -270,6 +287,9 @@ public final class OfflineLlmBridge {
         payload.put("llm_command", llmCommand != null ? llmCommand : JSONObject.NULL);
         JSONObject internalValidated = validation.command;
         JSONObject publicCommand = LlmPublicCommandSerializer.materialize(internalValidated);
+        String finalResolutionStatus = finalResolutionStatus(internalValidated);
+        payload.put("resolution_status", finalResolutionStatus);
+        payload.put("final_resolution_status", finalResolutionStatus);
         payload.put("internal_validated_command", internalValidated);
         payload.put("public_command", publicCommand);
         payload.put("normalized_command", publicCommand);
@@ -384,7 +404,11 @@ public final class OfflineLlmBridge {
         try {
             JSONObject copy = new JSONObject(candidate.toString());
             JSONObject hints = spacy != null ? spacy.optJSONObject("baseline_hints") : null;
-            if (hints != null) copy.put("detected_object_phrase", hints.optString("detected_object_phrase", ""));
+            if (hints != null) {
+                copy.put("detected_object_phrase", hints.optString("detected_object_phrase", ""));
+                copy.put("action_evidence", hints.optJSONObject("action_evidence"));
+                copy.put("evidence_supported_actions", hints.optJSONArray("evidence_supported_actions"));
+            }
             return copy;
         } catch (Throwable ignored) {
             return candidate;
@@ -426,7 +450,7 @@ public final class OfflineLlmBridge {
         value.put("raw_input", spacy != null ? spacy.optString("raw_input", rawText != null ? rawText : "") : (rawText != null ? rawText : ""));
         value.put("wake_word_suffix", spacy != null ? spacy.optString("wake_word_suffix", rawText != null ? rawText : "") : (rawText != null ? rawText : ""));
         value.put("analysis_input", input);
-        value.put("resolution_status", resolutionStatus);
+        value.put("recovery_status", recoveryStatus(spacy));
         value.put("repair_applied", spacy != null && spacy.optBoolean("repair_applied", false));
         value.put("repair_candidates", spacy != null ? spacy.optJSONArray("repair_candidates") : new JSONArray());
         value.put("selected_repair", spacy != null ? spacy.optString("selected_repair", "") : "");
@@ -436,6 +460,29 @@ public final class OfflineLlmBridge {
         value.put("baseline_candidate", hints != null ? hints.optJSONObject("command_candidate") : JSONObject.NULL);
         value.put("detected_object_phrase", detectedObjectPhrase(spacy, baselineEvidence(spacy)));
         return value;
+    }
+
+    private static boolean hasActionEvidence(JSONObject spacy, JSONObject baseline) {
+        JSONObject hints = spacy != null ? spacy.optJSONObject("baseline_hints") : null;
+        JSONObject evidence = hints != null ? hints.optJSONObject("action_evidence") : null;
+        JSONArray supported = evidence != null ? evidence.optJSONArray("supported_actions") : null;
+        if (supported == null && hints != null) supported = hints.optJSONArray("evidence_supported_actions");
+        if (evidence != null) return evidence.optBoolean("has_any", false) && supported != null && supported.length() > 0;
+        if (supported != null) return supported.length() > 0;
+        String action = evidenceAction(baseline);
+        return action != null && !action.isEmpty() && !"UNKNOWN".equals(action);
+    }
+
+    private static String recoveryStatus(JSONObject spacy) {
+        JSONObject hints = spacy != null ? spacy.optJSONObject("baseline_hints") : null;
+        String value = hints != null ? hints.optString("recovery_resolution_status", "") : "";
+        return value.isEmpty() ? "NO_RECOVERY" : value;
+    }
+
+    private static String finalResolutionStatus(JSONObject command) {
+        String action = command != null ? command.optString("action", "UNKNOWN") : "UNKNOWN";
+        if ("MISSING_INFO".equals(action)) return "MISSING_INFO";
+        return "UNKNOWN".equals(action) ? "UNKNOWN" : "RESOLVED";
     }
 
     private static String enrich(String json, JSONObject extra) {

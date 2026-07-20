@@ -1,3 +1,5 @@
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace Game.STT
@@ -63,6 +65,30 @@ namespace Game.STT
 #if UNITY_ANDROID && !UNITY_EDITOR
             using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
             bridge.CallStatic("releaseWhisper");
+#endif
+        }
+
+        public Task<string> WarmUpWhisperAsync(CancellationToken cancellationToken = default)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                AndroidJNI.AttachCurrentThread();
+                try
+                {
+                    using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+                    string result = bridge.CallStatic<string>("warmUpWhisper");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return result ?? string.Empty;
+                }
+                finally
+                {
+                    AndroidJNI.DetachCurrentThread();
+                }
+            }, cancellationToken);
+#else
+            return Task.FromResult("{\"ok\":true,\"stage\":\"editor_noop\",\"initialized\":true,\"context_reused\":true,\"durationMs\":0}");
 #endif
         }
     }

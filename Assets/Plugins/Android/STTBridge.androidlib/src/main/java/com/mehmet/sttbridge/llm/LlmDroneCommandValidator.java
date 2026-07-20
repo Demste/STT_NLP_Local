@@ -61,6 +61,12 @@ public final class LlmDroneCommandValidator {
             action = "UNKNOWN";
         }
 
+        if (!"UNKNOWN".equals(action) && !hasActionEvidence(evidence, action)) {
+            errors.put("action_evidence_absent:" + action);
+            warnings.put("llm_action_rejected_without_transcript_evidence:" + action);
+            action = "UNKNOWN";
+        }
+
         JSONObject trusted = new JSONObject();
         if (evidence != null && action.equals(evidenceAction(evidence))) {
             trusted = evidence;
@@ -84,6 +90,11 @@ public final class LlmDroneCommandValidator {
         }
 
         String intendedAction = upper(action);
+        if (!hasActionEvidence(baseline, intendedAction)) {
+            errors.put("action_evidence_absent:" + intendedAction);
+            warnings.put("semantic_slot_rejected_without_action_evidence:" + intendedAction);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
         if (!LlmCommandSchema.supportsObject(intendedAction)) {
             errors.put("object_not_allowed_for_action");
             return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
@@ -160,6 +171,20 @@ public final class LlmDroneCommandValidator {
     private static String evidenceAction(JSONObject evidence) {
         String action = upper(evidence.opt("action"));
         return "MISSING_INFO".equals(action) ? upper(evidence.opt("target_action")) : action;
+    }
+
+    private static boolean hasActionEvidence(JSONObject evidence, String action) {
+        if (evidence == null || action == null || action.isEmpty() || "UNKNOWN".equals(action)) return false;
+        JSONObject summary = evidence.optJSONObject("action_evidence");
+        JSONArray supported = summary != null ? summary.optJSONArray("supported_actions") : null;
+        if (supported == null) supported = evidence.optJSONArray("evidence_supported_actions");
+        if (supported != null) {
+            for (int i = 0; i < supported.length(); i++) {
+                if (action.equals(upper(supported.opt(i)))) return true;
+            }
+            return false;
+        }
+        return action.equals(evidenceAction(evidence));
     }
 
     private static String firstMissing(String action, JSONObject out, JSONObject evidence) {

@@ -8,7 +8,16 @@ namespace Game.NLP
 {
     public sealed class SpeechCommandPipeline : MonoBehaviour
     {
+        private static readonly TimeSpan SuggestionLifetime = TimeSpan.FromMinutes(2);
+
         [SerializeField] private SpeechCommandPipelineConfig config = new SpeechCommandPipelineConfig();
+        private readonly PendingCommandSuggestionStore pendingSuggestions =
+            new PendingCommandSuggestionStore(SuggestionLifetime);
+        private Func<string, string, CancellationToken, Task<string>> analyzeAsync =
+            Android.SpacyNlpAndroidBridgeClient.AnalyzeAsync;
+        private Func<string, string, string, CancellationToken, Task<string>> parseLlmAsync =
+            Android.OfflineLlmAndroidBridgeClient.ParseCommandAsync;
+        private long processGeneration;
 
         public event Action<SpeechCommandPipelineResult> Completed;
 
@@ -31,16 +40,19 @@ namespace Game.NLP
             string requestId = "",
             string rawTranscript = "")
         {
+            long generation = Interlocked.Increment(ref processGeneration);
+            pendingSuggestions.Clear();
             Stopwatch total = Stopwatch.StartNew();
             string configJson = ActiveConfigJson;
             string safeTranscript = transcript ?? string.Empty;
             string safeRawTranscript = string.IsNullOrWhiteSpace(rawTranscript) ? safeTranscript : rawTranscript;
-            string analysisContextJson = BuildAnalysisContextJson(configJson, safeRawTranscript);
+            string recoveryRequestKey = Guid.NewGuid().ToString("N");
+            string analysisContextJson = BuildAnalysisContextJson(configJson, safeRawTranscript, recoveryRequestKey);
             string logRequestId = string.IsNullOrWhiteSpace(requestId) ? "-" : requestId;
 
             Debug.Log($"[NLP] request_id={logRequestId} wake_word_suffix={safeTranscript}");
 
-            string nlpJson = await Android.SpacyNlpAndroidBridgeClient.AnalyzeAsync(
+            string nlpJson = await analyzeAsync(
                 safeTranscript,
                 analysisContextJson,
                 cancellationToken);
@@ -49,15 +61,66 @@ namespace Game.NLP
             NlpAnalysisResult nlp = SafeFromJson<NlpAnalysisResult>(nlpJson);
             ValidatedCommandResult baseline = DroneCommandJsonParser.ParseObjectForKey(nlpJson, "drone_command");
             if (nlp != null) nlp.drone_command = baseline;
+            CommandRecoveryResult recovery = CommandRecoveryResult.From(nlp?.baseline_hints, safeTranscript);
             bool baselineFinal = nlp != null
                 && nlp.baseline_hints != null
                 && nlp.baseline_hints.final_parser
                 && baseline != null;
             string analysisInput = !string.IsNullOrWhiteSpace(nlp?.analysis_input) ? nlp.analysis_input : safeTranscript;
             Debug.Log($"[NLP] request_id={logRequestId} analysis_input={analysisInput} repair_applied={(nlp != null && nlp.repair_applied)} resolution_status={nlp?.resolution_status}");
+            if (string.Equals(recovery.resolution_status, CommandRecoveryStatus.NeedsConfirmation, StringComparison.Ordinal))
+            {
+                SpeechCommandPipelineResult confirmationResult = new SpeechCommandPipelineResult
+                {
+                    transcript = safeTranscript,
+                    configJson = configJson,
+                    activeLlmConfigJson = ActiveLlmConfigJson,
+                    activeLlmConfigSummary = ActiveLlmConfigSummary,
+                    nlpJson = nlpJson,
+                    llmJson = string.Empty,
+                    nlp = nlp,
+                    llm = null,
+                    validated = null,
+                    finalJson = null,
+                    recovery = recovery,
+                    resolutionSource = "suggestion",
+                    recoveryStatus = recovery.resolution_status,
+                    finalResolutionStatus = CommandRecoveryStatus.NeedsConfirmation,
+                    llmCalled = false,
+                    totalDurationMs = total.ElapsedMilliseconds,
+                };
 
+                if (generation == Interlocked.Read(ref processGeneration))
+                {
+                    pendingSuggestions.ReplaceBatch(recoveryRequestKey, recovery.suggestions);
+                }
+                else
+                {
+                    recovery.suggestions = Array.Empty<CommandSuggestion>();
+                    recovery.resolution_status = CommandRecoveryStatus.InvalidOrStaleSuggestion;
+                }
+
+                LogRecovery(logRequestId, safeRawTranscript, recovery, false, null, CommandRecoveryStatus.NeedsConfirmation);
+                Debug.Log($"[NLP] request_id={logRequestId} llm_called=false resolution_source=suggestion final_action=null");
+                Completed?.Invoke(confirmationResult);
+                return confirmationResult;
+            }
+
+            bool actionEvidenceAbsent = !HasAnyActionEvidence(nlp, recovery, baseline);
             string llmJson;
-            if (baselineFinal)
+            bool evidencePreGateApplied = !baselineFinal && actionEvidenceAbsent;
+            if (evidencePreGateApplied)
+            {
+                recovery.resolution_status = CommandRecoveryStatus.Unknown;
+                llmJson = DroneCommandJsonParser.BuildEvidenceGateEnvelope(
+                    safeRawTranscript,
+                    safeTranscript,
+                    analysisInput,
+                    nlp != null && nlp.repair_applied,
+                    total.ElapsedMilliseconds);
+                Debug.Log($"[NLP] request_id={logRequestId} llm_called=false resolution_source=evidence_gate reason=action_evidence_absent");
+            }
+            else if (baselineFinal)
             {
                 string commandJson = DroneCommandJsonParser.RawObjectForKey(nlpJson, "drone_command");
                 llmJson = DroneCommandJsonParser.BuildBaselineEnvelope(
@@ -73,7 +136,7 @@ namespace Game.NLP
             else
             {
                 Debug.Log($"[NLP] request_id={logRequestId} llm_called=true resolution_source=pending_llm llm_input={analysisInput}");
-                llmJson = await Android.OfflineLlmAndroidBridgeClient.ParseCommandAsync(
+                llmJson = await parseLlmAsync(
                     safeTranscript,
                     nlpJson,
                     configJson,
@@ -92,8 +155,9 @@ namespace Game.NLP
                 llmJson = llmJson,
                 nlp = nlp,
                 llm = llm,
-                resolutionSource = baselineFinal ? "baseline" : (llm != null ? llm.resolution_source : "fallback"),
-                llmCalled = !baselineFinal && llm != null && llm.llm_called,
+                recovery = recovery,
+                resolutionSource = evidencePreGateApplied ? "evidence_gate" : (baselineFinal ? "baseline" : (llm != null ? llm.resolution_source : "fallback")),
+                llmCalled = !evidencePreGateApplied && !baselineFinal && llm != null && llm.llm_called,
             };
 
             result.validated = result.llm != null ? result.llm.public_command : null;
@@ -107,7 +171,21 @@ namespace Game.NLP
             }
 
             result.finalJson = DroneCommandJsonParser.RawObjectForKey(llmJson, "public_command");
+            if (!evidencePreGateApplied && result.llmCalled && !IsActionSupportedByEvidence(result.validated, nlp, recovery, baseline))
+            {
+                ApplyEvidenceRejection(result);
+            }
+
+            result.recoveryStatus = recovery.resolution_status;
+            result.finalResolutionStatus = FinalResolutionStatus(result.validated);
+            if (result.llm != null)
+            {
+                result.llm.recovery_status = result.recoveryStatus;
+                result.llm.final_resolution_status = result.finalResolutionStatus;
+                result.llm.resolution_status = result.finalResolutionStatus;
+            }
             result.totalDurationMs = total.ElapsedMilliseconds;
+            LogRecovery(logRequestId, safeRawTranscript, recovery, result.llmCalled, result.validated?.action, result.finalResolutionStatus);
 
             Debug.Log(
                 $"[NLP] request_id={logRequestId} spacy_duration={FormatMs(nlp?.spacy_duration_ms)} "
@@ -115,10 +193,114 @@ namespace Game.NLP
                 + $"slot_extraction_duration={FormatMs(nlp?.slot_extraction_duration_ms)} llm_prompt_tokens={(llm != null ? llm.llm_prompt_tokens : 0)} "
                 + $"llm_prompt_eval_duration=unavailable llm_first_token_duration=unavailable "
                 + $"llm_generation_duration={(llm != null ? llm.llm_generation_duration : 0)}ms validation_duration={(llm != null ? llm.validation_duration : 0)}ms "
+                + $"recovery_status={result.recoveryStatus} final_resolution_status={result.finalResolutionStatus} "
                 + $"resolution_source={result.resolutionSource} llm_called={result.llmCalled}");
             Debug.Log($"[NLP] request_id={logRequestId} resolution_source={result.resolutionSource} llm_called={result.llmCalled} validated_command={ToJsonForLog(result.validated)}");
             Completed?.Invoke(result);
             return result;
+        }
+
+        public async Task<SuggestionDecisionResult> ConfirmSuggestionAsync(
+            string suggestionId,
+            CancellationToken cancellationToken = default)
+        {
+            if (!pendingSuggestions.TryConsume(suggestionId, out CommandSuggestion suggestion))
+            {
+                return InvalidSuggestionDecision(suggestionId);
+            }
+
+            SpeechCommandPipelineResult result = await ProcessTranscriptAsync(
+                suggestion.suggested_command,
+                cancellationToken,
+                "confirmation:" + suggestion.suggestion_id,
+                suggestion.suggested_command);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (result == null
+                || result.validated == null
+                || string.Equals(result.recovery?.resolution_status, CommandRecoveryStatus.NeedsConfirmation, StringComparison.Ordinal))
+            {
+                return new SuggestionDecisionResult
+                {
+                    accepted = false,
+                    suggestion_id = suggestionId ?? string.Empty,
+                    resolution_status = CommandRecoveryStatus.InvalidOrStaleSuggestion,
+                    message = "Öneri güvenli bir komuta çözümlenemedi; komutu tekrar söyleyin.",
+                    pipeline_result = null,
+                };
+            }
+
+            result.recovery.resolution_status = CommandRecoveryStatus.ResolvedAfterConfirmation;
+            result.recovery.parser_source = "confirmed_deterministic";
+            return new SuggestionDecisionResult
+            {
+                accepted = true,
+                suggestion_id = suggestionId,
+                resolution_status = CommandRecoveryStatus.ResolvedAfterConfirmation,
+                message = result.validated.action == "MISSING_INFO"
+                    ? result.validated.missing_message
+                    : "Öneri doğrulandı.",
+                pipeline_result = result,
+            };
+        }
+
+        public SuggestionDecisionResult RejectSuggestion(string suggestionId)
+        {
+            if (!pendingSuggestions.Reject(suggestionId))
+            {
+                return InvalidSuggestionDecision(suggestionId);
+            }
+
+            return new SuggestionDecisionResult
+            {
+                accepted = false,
+                suggestion_id = suggestionId ?? string.Empty,
+                resolution_status = CommandRecoveryStatus.Rejected,
+                message = "Öneri reddedildi; komutu tekrar söyleyin.",
+                pipeline_result = null,
+            };
+        }
+
+        public void ResetSuggestions()
+        {
+            Interlocked.Increment(ref processGeneration);
+            pendingSuggestions.Clear();
+        }
+
+        private void OnEnable()
+        {
+            ResetSuggestions();
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.playModeStateChanged -= OnEditorPlayModeStateChanged;
+            UnityEditor.EditorApplication.playModeStateChanged += OnEditorPlayModeStateChanged;
+#endif
+        }
+
+        private void OnDisable()
+        {
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.playModeStateChanged -= OnEditorPlayModeStateChanged;
+#endif
+            ResetSuggestions();
+        }
+
+#if UNITY_EDITOR
+        private void OnEditorPlayModeStateChanged(UnityEditor.PlayModeStateChange state)
+        {
+            ResetSuggestions();
+        }
+#endif
+
+        private static SuggestionDecisionResult InvalidSuggestionDecision(string suggestionId)
+        {
+            return new SuggestionDecisionResult
+            {
+                accepted = false,
+                suggestion_id = suggestionId ?? string.Empty,
+                resolution_status = CommandRecoveryStatus.InvalidOrStaleSuggestion,
+                message = "Öneri geçersiz veya artık güncel değil; komutu tekrar söyleyin.",
+                pipeline_result = null,
+            };
         }
 
         private static T SafeFromJson<T>(string json) where T : class
@@ -149,7 +331,7 @@ namespace Game.NLP
             return value.HasValue ? value.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "ms" : "unavailable";
         }
 
-        private static string BuildAnalysisContextJson(string configJson, string rawTranscript)
+        private static string BuildAnalysisContextJson(string configJson, string rawTranscript, string recoveryRequestKey)
         {
             string source = string.IsNullOrWhiteSpace(configJson)
                 ? SpeechCommandPipelineConfig.DefaultConfigJson
@@ -164,7 +346,135 @@ namespace Game.NLP
             string prefix = source.Substring(0, end).TrimEnd();
             bool needsComma = prefix.Length > 1 && prefix[prefix.Length - 1] != '{';
             return prefix + (needsComma ? "," : string.Empty)
-                + "\"raw_transcript\":\"" + EscapeJson(rawTranscript ?? string.Empty) + "\"}";
+                + "\"raw_transcript\":\"" + EscapeJson(rawTranscript ?? string.Empty) + "\","
+                + "\"recovery_request_key\":\"" + EscapeJson(recoveryRequestKey ?? string.Empty) + "\"}";
+        }
+
+        private static void LogRecovery(
+            string requestId,
+            string rawTranscript,
+            CommandRecoveryResult recovery,
+            bool llmCalled,
+            string finalAction,
+            string finalResolutionStatus)
+        {
+            if (recovery == null)
+            {
+                return;
+            }
+
+            Debug.Log(
+                $"[CommandRecovery] request_id={requestId} raw_transcript=\"{EscapeJson(rawTranscript ?? string.Empty)}\" "
+                + $"original_suffix=\"{EscapeJson(recovery.original_suffix)}\" normalized_suffix=\"{EscapeJson(recovery.normalized_suffix)}\" "
+                + $"corrected_suffix=\"{EscapeJson(recovery.corrected_suffix)}\" correction_applied={recovery.correction_applied.ToString().ToLowerInvariant()} "
+                + $"confidence={recovery.correction_confidence.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture)} "
+                + $"reason={recovery.correction_reason} candidate_action={recovery.candidate_action} candidate_count={recovery.candidate_count} "
+                + $"candidate_gap={recovery.candidate_gap.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture)} "
+                + $"parser_input=\"{EscapeJson(recovery.parser_input)}\" parser_source={recovery.parser_source} "
+                + $"recovery_status={recovery.resolution_status} final_resolution_status={finalResolutionStatus ?? "UNKNOWN"} "
+                + $"llm_called={llmCalled.ToString().ToLowerInvariant()} final_action={finalAction ?? "null"}");
+        }
+
+        private static bool HasAnyActionEvidence(
+            NlpAnalysisResult nlp,
+            CommandRecoveryResult recovery,
+            ValidatedCommandResult baseline)
+        {
+            ActionEvidenceSummary evidence = nlp?.baseline_hints?.action_evidence;
+            if (evidence != null)
+            {
+                return evidence.has_any && evidence.supported_actions != null && evidence.supported_actions.Length > 0;
+            }
+
+            string deterministicAction = IntendedAction(baseline);
+            if (!string.IsNullOrWhiteSpace(deterministicAction) && deterministicAction != "UNKNOWN")
+            {
+                return true;
+            }
+
+            return recovery != null && (recovery.candidate_count > 0 || (recovery.suggestions?.Length ?? 0) > 0);
+        }
+
+        private static bool IsActionSupportedByEvidence(
+            ValidatedCommandResult command,
+            NlpAnalysisResult nlp,
+            CommandRecoveryResult recovery,
+            ValidatedCommandResult baseline)
+        {
+            string action = IntendedAction(command);
+            if (string.IsNullOrWhiteSpace(action) || action == "UNKNOWN")
+            {
+                return true;
+            }
+
+            ActionEvidenceSummary evidence = nlp?.baseline_hints?.action_evidence;
+            if (evidence != null)
+            {
+                return evidence.Supports(action);
+            }
+
+            if (string.Equals(IntendedAction(baseline), action, StringComparison.Ordinal)
+                || string.Equals(recovery?.candidate_action, action, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (recovery?.suggestions != null)
+            {
+                foreach (CommandSuggestion suggestion in recovery.suggestions)
+                {
+                    if (string.Equals(suggestion?.suggested_action, action, StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void ApplyEvidenceRejection(SpeechCommandPipelineResult result)
+        {
+            ValidatedCommandResult unknown = new ValidatedCommandResult { action = "UNKNOWN", confidence = 0d };
+            result.validated = unknown;
+            result.finalJson = DroneCommandJsonParser.ToPublicJson(unknown);
+            result.resolutionSource = "evidence_gate";
+            if (result.recovery != null)
+            {
+                result.recovery.resolution_status = CommandRecoveryStatus.Unknown;
+            }
+            if (result.llm != null)
+            {
+                result.llm.stage = "action_evidence_rejected";
+                result.llm.resolution_source = "evidence_gate";
+                result.llm.resolution_status = CommandRecoveryStatus.Unknown;
+                result.llm.public_command = unknown;
+                result.llm.validated_command = unknown;
+                result.llm.normalized_command = unknown;
+                result.llm.internal_validated_command = unknown;
+            }
+        }
+
+        private static string IntendedAction(ValidatedCommandResult command)
+        {
+            if (command == null)
+            {
+                return string.Empty;
+            }
+
+            return string.Equals(command.action, "MISSING_INFO", StringComparison.Ordinal)
+                ? command.target_action ?? string.Empty
+                : command.action ?? string.Empty;
+        }
+
+        private static string FinalResolutionStatus(ValidatedCommandResult command)
+        {
+            if (command == null || string.IsNullOrWhiteSpace(command.action) || command.action == "UNKNOWN")
+            {
+                return CommandRecoveryStatus.Unknown;
+            }
+
+            return command.action == "MISSING_INFO" ? CommandRecoveryStatus.MissingInfo : "RESOLVED";
         }
 
         private static string EscapeJson(string value)
@@ -185,9 +495,12 @@ namespace Game.NLP
         public string llmJson;
         public NlpAnalysisResult nlp;
         public LlmCommandResult llm;
+        public CommandRecoveryResult recovery;
         public ValidatedCommandResult validated;
         public string finalJson;
         public string resolutionSource;
+        public string recoveryStatus;
+        public string finalResolutionStatus;
         public bool llmCalled;
         public long totalDurationMs;
     }

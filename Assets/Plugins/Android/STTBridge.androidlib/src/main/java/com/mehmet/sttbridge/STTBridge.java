@@ -332,6 +332,7 @@ public final class STTBridge {
 
     private static String transcribeWhisper(String wavPath, String language) throws Exception {
         synchronized (WHISPER_STATE_LOCK) {
+            long initStarted = System.currentTimeMillis();
             ensureWhisperNativeLoaded();
 
             Context context = getUnityAppContextOrThrow();
@@ -355,19 +356,76 @@ public final class STTBridge {
                 whisperLoadedModelPath = modelPath;
             }
 
+            long initDurationMs = modelAlreadyLoaded ? 0L : System.currentTimeMillis() - initStarted;
+            long inferenceStarted = System.currentTimeMillis();
+
             String nativeJson = whisperTranscribeNative(
                     whisperNativeHandle,
                     wavPath,
                     normalizedLanguage
             );
             WhisperNativeResult nativeResult = WhisperNativeResult.parse(nativeJson);
+            long inferenceDurationMs = System.currentTimeMillis() - inferenceStarted;
 
             if (!nativeResult.ok) {
                 throw new IllegalStateException(nativeResult.error.isEmpty()
                         ? "whisper.cpp native transcription failed."
                         : nativeResult.error);
             }
+            double audioDurationMs = nativeResult.audioDurationSec * 1000.0;
+            double realtimeFactor = audioDurationMs > 0.0 ? inferenceDurationMs / audioDurationMs : 0.0;
+            Log.i(TAG, String.format(
+                    Locale.US,
+                    "[InferenceTiming] whisper_context_reused=%s whisper_init_duration_ms=%d whisper_inference_duration_ms=%d audio_duration_ms=%.3f realtime_factor=%.4f native_whisper_full_ms=%.3f",
+                    modelAlreadyLoaded, initDurationMs, inferenceDurationMs, audioDurationMs, realtimeFactor, nativeResult.whisperFullMs));
             return nativeResult.text;
+        }
+    }
+
+    /** Initializes and caches the Whisper model/context without dummy inference. */
+    public static String warmUpWhisper() {
+        long started = System.currentTimeMillis();
+        synchronized (WHISPER_STATE_LOCK) {
+            try {
+                ensureWhisperNativeLoaded();
+                Context context = getUnityAppContextOrThrow();
+                File modelFile = resolveWhisperModel(context);
+                String modelPath = modelFile.getAbsolutePath();
+                boolean reused = whisperNativeHandle != 0L && modelPath.equals(whisperLoadedModelPath);
+                if (!reused) {
+                    if (whisperNativeHandle != 0L) {
+                        whisperFreeNative(whisperNativeHandle);
+                        whisperNativeHandle = 0L;
+                        whisperLoadedModelPath = "";
+                    }
+                    whisperNativeHandle = whisperInitNative(modelPath, WHISPER_THREAD_COUNT);
+                    if (whisperNativeHandle == 0L) {
+                        throw new IllegalStateException("whisper.cpp warm-up returned handle 0: " + modelPath);
+                    }
+                    whisperLoadedModelPath = modelPath;
+                }
+                JSONObject payload = new JSONObject();
+                payload.put("ok", true);
+                payload.put("stage", "whisper_warmed");
+                payload.put("initialized", true);
+                payload.put("context_reused", reused);
+                payload.put("durationMs", System.currentTimeMillis() - started);
+                return payload.toString();
+            } catch (Throwable t) {
+                Log.e(TAG, "Whisper warm-up failed.", t);
+                try {
+                    JSONObject payload = new JSONObject();
+                    payload.put("ok", false);
+                    payload.put("stage", "whisper_warm_up_failed");
+                    payload.put("initialized", false);
+                    payload.put("context_reused", false);
+                    payload.put("durationMs", System.currentTimeMillis() - started);
+                    payload.put("error", t.getMessage() != null ? t.getMessage() : t.toString());
+                    return payload.toString();
+                } catch (Throwable ignored) {
+                    return "{\"ok\":false,\"stage\":\"whisper_warm_up_failed\"}";
+                }
+            }
         }
     }
 

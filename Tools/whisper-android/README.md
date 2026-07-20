@@ -44,8 +44,27 @@ above after checkout.
 
 The native command-mode parameters are Turkish language, translation off,
 greedy decoding (`temperature = 0.0`), timestamps off, single-segment output,
-no aggressive token/character limit, and the Turkish drone-command initial
-prompt in `whisper_jni.cpp`.
+the model-default token/audio context limits, and the Turkish drone-command
+initial prompt in `whisper_jni.cpp`.
+
+## Performance tuning
+
+The active reference/default profile keeps the multilingual base model and the
+previously reliable Turkish command settings:
+
+- Reference/default: `threads=4`, `max_tokens=0`, `audio_ctx=0` (model default)
+- Initial prompt: `turkish_drone_commands_v1`
+
+The experimental `threads=6`, `max_tokens=48`, `audio_ctx=768` profile must not
+be used as the default. On the target Android device it increased Whisper
+latency from about 7 seconds to 35-40 seconds and regressed Turkish recognition
+(`Kartal` became `Artal`, and `iki metre` was split incorrectly). Any future
+performance profile should change one variable at a time and be measured
+separately against this reference profile.
+
+These are native source settings. They do not affect the packaged app until
+`libstt_whisper.so` is rebuilt with `Tools/whisper-android/build_android_arm64.sh`
+and a new Unity Android build is produced.
 
 Prepare the ignored third-party checkout once:
 

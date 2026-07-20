@@ -140,6 +140,27 @@ namespace Game.NLP
         public static string BuildBaselineEnvelope(string input, string commandJson, long durationMs) =>
             BuildBaselineEnvelope(input, input, input, "RESOLVED", false, commandJson, durationMs);
 
+        public static string BuildEvidenceGateEnvelope(
+            string rawInput,
+            string wakeWordSuffix,
+            string analysisInput,
+            bool repairApplied,
+            long durationMs)
+        {
+            string envelope = BuildBaselineEnvelope(
+                rawInput,
+                wakeWordSuffix,
+                analysisInput,
+                "UNKNOWN",
+                repairApplied,
+                "{\"action\":\"UNKNOWN\",\"confidence\":0.0}",
+                durationMs);
+            return envelope
+                .Replace("\"stage\":\"baseline_resolved\"", "\"stage\":\"action_evidence_absent\"")
+                .Replace("\"resolution_source\":\"baseline\"", "\"resolution_source\":\"evidence_gate\"")
+                .Replace("\"resolution_status\":\"UNKNOWN\"", "\"resolution_status\":\"UNKNOWN\",\"recovery_status\":\"UNKNOWN\",\"final_resolution_status\":\"UNKNOWN\"");
+        }
+
         private static string ExtractObjectForKey(string json, string key)
         {
             if (string.IsNullOrWhiteSpace(json)) return string.Empty;

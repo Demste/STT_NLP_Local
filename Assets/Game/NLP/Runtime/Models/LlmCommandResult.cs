@@ -23,6 +23,8 @@ namespace Game.NLP
         public string[] repair_notes;
         public double repair_duration_ms;
         public string resolution_status;
+        public string recovery_status;
+        public string final_resolution_status;
         public bool action_llm_called;
         public bool slot_llm_called;
         public string action_llm_raw;

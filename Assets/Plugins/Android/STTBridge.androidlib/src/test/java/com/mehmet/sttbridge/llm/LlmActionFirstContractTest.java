@@ -1,6 +1,7 @@
 package com.mehmet.sttbridge.llm;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 public final class LlmActionFirstContractTest {
     public static void main(String[] args) throws Exception {
@@ -12,6 +13,7 @@ public final class LlmActionFirstContractTest {
         semanticObjectSlotIsEvidenceGated();
         publicSerializerIsFixedShape();
         trustedMetadataSurvivesUnknown();
+        actionWithoutEvidenceIsRejected();
         System.out.println("LlmActionFirstContractTest: OK");
     }
 
@@ -23,7 +25,7 @@ public final class LlmActionFirstContractTest {
                 .put("object", "TRUCK")
                 .put("color", "GREEN")
                 .put("coordinate", new JSONObject().put("lat", 36).put("lon", 36));
-        LlmDroneCommandValidator.Result result = LlmDroneCommandValidator.validateClassification(malicious, null, new JSONObject());
+        LlmDroneCommandValidator.Result result = LlmDroneCommandValidator.validateClassification(malicious, evidence("LAND_HOME"), new JSONObject());
         assertEquals("LAND_HOME", result.command.getString("action"));
         assertEquals(2, result.command.length());
         assertTrue(result.command.has("confidence"), "pipeline confidence missing");
@@ -39,7 +41,7 @@ public final class LlmActionFirstContractTest {
 
     private static void missingInfoComesFromCatalog() throws Exception {
         JSONObject classification = new JSONObject().put("action", "TURN").put("angle_deg", 99);
-        LlmDroneCommandValidator.Result result = LlmDroneCommandValidator.validateClassification(classification, null, new JSONObject());
+        LlmDroneCommandValidator.Result result = LlmDroneCommandValidator.validateClassification(classification, evidence("TURN"), new JSONObject());
         assertEquals("MISSING_INFO", result.command.getString("action"));
         assertEquals("TURN", result.command.getString("target_action"));
         assertEquals("turn_direction", result.command.getString("missing_field"));
@@ -81,7 +83,8 @@ public final class LlmActionFirstContractTest {
         JSONObject baseline = new JSONObject()
                 .put("action", "MISSING_INFO")
                 .put("target_action", "FIND_OBJECT")
-                .put("detected_object_phrase", "ağır vasıtayı");
+                .put("detected_object_phrase", "ağır vasıtayı")
+                .put("action_evidence", evidenceSummary("FIND_OBJECT"));
         JSONObject valid = new JSONObject().put("object", "TRUCK").put("evidence", "ağır vasıtayı");
         LlmDroneCommandValidator.Result accepted = LlmDroneCommandValidator.validateSemanticSlot(
                 valid, baseline, "FIND_OBJECT", "Kartal ağır vasıtayı bul", new JSONObject());
@@ -130,6 +133,27 @@ public final class LlmActionFirstContractTest {
         assertEquals(0.0, result.command.getDouble("confidence"));
         assertEquals("NORMAL", result.command.getString("voice_type"));
         assertEquals("GOOD", result.command.getString("stt_confidence_level"));
+    }
+
+    private static void actionWithoutEvidenceIsRejected() throws Exception {
+        LlmDroneCommandValidator.Result result = LlmDroneCommandValidator.validateClassification(
+                new JSONObject().put("action", "MOVE_DIRECTION"),
+                new JSONObject().put("action", "UNKNOWN").put("action_evidence", evidenceSummary()),
+                new JSONObject());
+        assertEquals("UNKNOWN", result.command.getString("action"));
+        assertTrue(!result.command.has("target_action"), "unsupported LLM action created target_action");
+        assertTrue(!result.command.has("missing_field"), "unsupported LLM action created missing_field");
+        assertTrue(result.errors.length() > 0, "missing evidence must be explicit");
+    }
+
+    private static JSONObject evidence(String action) throws Exception {
+        return new JSONObject().put("action", action).put("action_evidence", evidenceSummary(action));
+    }
+
+    private static JSONObject evidenceSummary(String... actions) throws Exception {
+        JSONArray supported = new JSONArray();
+        for (String action : actions) supported.put(action);
+        return new JSONObject().put("has_any", actions.length > 0).put("supported_actions", supported);
     }
 
     private static void assertTrue(boolean value, String message) {

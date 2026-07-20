@@ -1,4 +1,5 @@
 using Game.NLP;
+using Game.STT;
 using TMPro;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -14,6 +15,8 @@ namespace Game.NLP.Editor
         private const string RootName = "NLP_Command_Debug_Root";
         private const string PipelineName = "SpeechCommandPipeline";
         private const string TestPhrase = "ileri git";
+        private const string TestScenePath = "Assets/Scenes/Test.unity";
+        private const string RecoveryRootName = "CommandRecoveryUI";
 
         [MenuItem(MenuPath)]
         public static void CreateSpeechCommandDebugPanel()
@@ -45,6 +48,173 @@ namespace Game.NLP.Editor
             Selection.activeGameObject = root;
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
             Debug.Log("[NLP] Speech command debug panel created/updated in active scene. Scene was marked dirty but not saved.");
+        }
+
+        [MenuItem("Tools/NLP/Integrate Recovery UI Into Test Scene")]
+        public static void IntegrateRecoveryUiIntoTestScene()
+        {
+            UnityEngine.SceneManagement.Scene scene = EditorSceneManager.OpenScene(TestScenePath, OpenSceneMode.Single);
+            STTTestController controller = Object.FindFirstObjectByType<STTTestController>();
+            if (controller == null)
+            {
+                throw new MissingReferenceException("Test.unity içinde STTTestController bulunamadı.");
+            }
+
+            SerializedObject controllerObject = new SerializedObject(controller);
+            TMP_Text jsonText = controllerObject.FindProperty("nlpJsonResultText").objectReferenceValue as TMP_Text;
+            if (jsonText == null || jsonText.transform.parent == null)
+            {
+                throw new MissingReferenceException("STTTestController.nlpJsonResultText veya mevcut ScrollView/Content bağlantısı eksik.");
+            }
+
+            Transform content = jsonText.transform.parent;
+            Transform oldRoot = content.Find(RecoveryRootName);
+            if (oldRoot != null)
+            {
+                Object.DestroyImmediate(oldRoot.gameObject);
+            }
+
+            GameObject root = CreateUiObject(RecoveryRootName, content);
+            root.transform.SetSiblingIndex(jsonText.transform.GetSiblingIndex());
+            VerticalLayoutGroup rootLayout = root.AddComponent<VerticalLayoutGroup>();
+            rootLayout.spacing = 12f;
+            rootLayout.childControlWidth = true;
+            rootLayout.childControlHeight = true;
+            rootLayout.childForceExpandWidth = true;
+            rootLayout.childForceExpandHeight = false;
+            ContentSizeFitter rootFitter = root.AddComponent<ContentSizeFitter>();
+            rootFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            GameObject correctionPanel = CreateRecoveryPanel("CorrectionInfoPanel", root.transform, new Color(0.10f, 0.32f, 0.24f, 0.96f), 96f);
+            TMP_Text correctionText = CreatePaddedText("CorrectionInfoText", correctionPanel.transform, 24, FontStyles.Normal, new Color(0.88f, 1f, 0.91f, 1f));
+
+            GameObject suggestionPanel = CreateRecoveryPanel("SuggestionPanel", root.transform, new Color(0.13f, 0.18f, 0.30f, 0.98f), 320f);
+            VerticalLayoutGroup suggestionLayout = suggestionPanel.AddComponent<VerticalLayoutGroup>();
+            suggestionLayout.padding = new RectOffset(18, 18, 18, 18);
+            suggestionLayout.spacing = 10f;
+            suggestionLayout.childControlWidth = true;
+            suggestionLayout.childControlHeight = true;
+            suggestionLayout.childForceExpandWidth = true;
+            suggestionLayout.childForceExpandHeight = false;
+            ContentSizeFitter suggestionFitter = suggestionPanel.AddComponent<ContentSizeFitter>();
+            suggestionFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            TMP_Text suggestionTitle = CreateLayoutText("SuggestionTitleText", suggestionPanel.transform, "Bu komutu mu demek istediniz?", 27, FontStyles.Bold, Color.white, 48f);
+            suggestionTitle.alignment = TextAlignmentOptions.Left;
+            TMP_Text suggestionMessage = CreateLayoutText("SuggestionMessageText", suggestionPanel.transform, string.Empty, 24, FontStyles.Normal, new Color(0.86f, 0.91f, 1f, 1f), 62f);
+
+            GameObject optionsObject = CreateUiObject("SuggestionOptions", suggestionPanel.transform);
+            VerticalLayoutGroup optionsLayout = optionsObject.AddComponent<VerticalLayoutGroup>();
+            optionsLayout.spacing = 10f;
+            optionsLayout.childControlWidth = true;
+            optionsLayout.childControlHeight = true;
+            optionsLayout.childForceExpandWidth = true;
+            optionsLayout.childForceExpandHeight = false;
+            ContentSizeFitter optionsFitter = optionsObject.AddComponent<ContentSizeFitter>();
+            optionsFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            CommandSuggestionOptionView optionTemplate = CreateSuggestionTemplate(optionsObject.transform);
+            TMP_Text suggestionStatus = CreateLayoutText("SuggestionStatusText", suggestionPanel.transform, string.Empty, 23, FontStyles.Italic, new Color(0.85f, 0.90f, 1f, 1f), 42f);
+            Button rejectButton = CreateRecoveryButton("RejectSuggestionButton", suggestionPanel.transform, "Reddet ve tekrar söyle", new Color(0.48f, 0.16f, 0.18f, 1f));
+
+            TMP_Text feedbackText = CreateLayoutText("UserFeedbackText", root.transform, string.Empty, 25, FontStyles.Bold, new Color(1f, 0.88f, 0.55f, 1f), 88f);
+            TMP_Text debugText = CreateLayoutText("RecoveryDebugText", root.transform, string.Empty, 22, FontStyles.Normal, new Color(0.68f, 0.88f, 1f, 1f), 255f);
+
+            SpeechCommandRecoveryView view = root.AddComponent<SpeechCommandRecoveryView>();
+            view.Configure(
+                correctionPanel,
+                correctionText,
+                suggestionPanel,
+                suggestionMessage,
+                optionsObject.GetComponent<RectTransform>(),
+                optionTemplate,
+                suggestionStatus,
+                rejectButton,
+                feedbackText,
+                debugText);
+
+            controllerObject.FindProperty("commandRecoveryView").objectReferenceValue = view;
+            controllerObject.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(controller);
+            EditorUtility.SetDirty(view);
+            EditorSceneManager.MarkSceneDirty(scene);
+            if (!EditorSceneManager.SaveScene(scene, TestScenePath))
+            {
+                throw new UnityException("Test.unity kaydedilemedi.");
+            }
+
+            Debug.Log("[NLP] Test.unity recovery UI integrated and saved.");
+        }
+
+        private static GameObject CreateRecoveryPanel(string name, Transform parent, Color color, float minHeight)
+        {
+            GameObject panel = CreateUiObject(name, parent);
+            Image image = panel.AddComponent<Image>();
+            image.color = color;
+            image.raycastTarget = true;
+            LayoutElement layout = panel.AddComponent<LayoutElement>();
+            layout.minHeight = minHeight;
+            layout.preferredHeight = minHeight;
+            return panel;
+        }
+
+        private static TMP_Text CreatePaddedText(string name, Transform parent, int size, FontStyles style, Color color)
+        {
+            TMP_Text text = CreateText(name, parent, string.Empty, size, style);
+            text.color = color;
+            text.margin = new Vector4(18f, 12f, 18f, 12f);
+            text.alignment = TextAlignmentOptions.MidlineLeft;
+            Stretch(text.rectTransform, Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero);
+            return text;
+        }
+
+        private static TMP_Text CreateLayoutText(string name, Transform parent, string value, int size, FontStyles style, Color color, float height)
+        {
+            TMP_Text text = CreateText(name, parent, value, size, style);
+            text.color = color;
+            text.textWrappingMode = TextWrappingModes.Normal;
+            LayoutElement layout = text.gameObject.AddComponent<LayoutElement>();
+            layout.minHeight = height;
+            layout.preferredHeight = height;
+            return text;
+        }
+
+        private static CommandSuggestionOptionView CreateSuggestionTemplate(Transform parent)
+        {
+            GameObject templateObject = CreateUiObject("SuggestionOptionTemplate", parent);
+            Image image = templateObject.AddComponent<Image>();
+            image.color = new Color(0.16f, 0.45f, 0.82f, 1f);
+            image.raycastTarget = true;
+            Button button = templateObject.AddComponent<Button>();
+            LayoutElement layout = templateObject.AddComponent<LayoutElement>();
+            layout.minHeight = 76f;
+            layout.preferredHeight = 76f;
+            TMP_Text label = CreateText("Label", templateObject.transform, string.Empty, 24, FontStyles.Bold);
+            label.color = Color.white;
+            label.alignment = TextAlignmentOptions.Center;
+            label.margin = new Vector4(16f, 8f, 16f, 8f);
+            Stretch(label.rectTransform, Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero);
+            CommandSuggestionOptionView option = templateObject.AddComponent<CommandSuggestionOptionView>();
+            option.Configure(button, label);
+            templateObject.SetActive(false);
+            return option;
+        }
+
+        private static Button CreateRecoveryButton(string name, Transform parent, string labelText, Color color)
+        {
+            GameObject buttonObject = CreateUiObject(name, parent);
+            Image image = buttonObject.AddComponent<Image>();
+            image.color = color;
+            image.raycastTarget = true;
+            Button button = buttonObject.AddComponent<Button>();
+            LayoutElement layout = buttonObject.AddComponent<LayoutElement>();
+            layout.minHeight = 76f;
+            layout.preferredHeight = 76f;
+            TMP_Text label = CreateText("Label", buttonObject.transform, labelText, 24, FontStyles.Bold);
+            label.alignment = TextAlignmentOptions.Center;
+            label.color = Color.white;
+            Stretch(label.rectTransform, Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero);
+            return button;
         }
 
         private static Canvas EnsureCanvas()

@@ -15,6 +15,7 @@ import java.io.StringWriter;
 public final class SpacyNlpBridge {
     private static final String TAG = "SpacyNlpBridge";
     private static final String MODULE_NAME = "command_parser";
+    private static final Object PYTHON_LOCK = new Object();
 
     private SpacyNlpBridge() {}
 
@@ -28,25 +29,46 @@ public final class SpacyNlpBridge {
                 throw new IllegalArgumentException("Context is null.");
             }
 
-            Context appContext = context.getApplicationContext();
-
-            if (!Python.isStarted()) {
-                Python.start(new AndroidPlatform(appContext));
+            synchronized (PYTHON_LOCK) {
+                PyObject module = ensureModule(context.getApplicationContext());
+                PyObject result = module.callAttr(
+                        "parse_command",
+                        text != null ? text : "",
+                        contextJson != null ? contextJson : ""
+                );
+                return result != null ? result.toString() : buildErrorJson("python_returned_null", null);
             }
-
-            Python python = Python.getInstance();
-            PyObject module = python.getModule(MODULE_NAME);
-            PyObject result = module.callAttr(
-                    "parse_command",
-                    text != null ? text : "",
-                    contextJson != null ? contextJson : ""
-            );
-
-            return result != null ? result.toString() : buildErrorJson("python_returned_null", null);
         } catch (Throwable t) {
             Log.e(TAG, "spaCy NLP bridge failed.", t);
             return buildErrorJson("java_bridge_failed", t);
         }
+    }
+
+    public static String warmUp(Context context) {
+        long started = System.currentTimeMillis();
+        try {
+            if (context == null) throw new IllegalArgumentException("Context is null.");
+            synchronized (PYTHON_LOCK) {
+                boolean pythonReused = Python.isStarted();
+                PyObject module = ensureModule(context.getApplicationContext());
+                PyObject result = module.callAttr("warm_up");
+                if (result == null) return buildErrorJson("python_warm_up_returned_null", null);
+                JSONObject payload = new JSONObject(result.toString());
+                payload.put("python_runtime_reused", pythonReused);
+                payload.put("bridge_duration_ms", System.currentTimeMillis() - started);
+                return payload.toString();
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Python/spaCy warm-up failed.", t);
+            return buildErrorJson("python_spacy_warm_up_failed", t);
+        }
+    }
+
+    private static PyObject ensureModule(Context appContext) {
+        if (!Python.isStarted()) {
+            Python.start(new AndroidPlatform(appContext));
+        }
+        return Python.getInstance().getModule(MODULE_NAME);
     }
 
     private static String buildErrorJson(String stage, Throwable throwable) {

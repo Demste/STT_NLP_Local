@@ -25,6 +25,7 @@ constexpr int kRequiredSampleRate = 16000;
 constexpr int kDefaultThreadCount = 4;
 constexpr int kMinThreadCount = 1;
 constexpr int kMaxThreadCount = 6;
+constexpr const char * kTurkishDronePromptVersion = "turkish_drone_commands_v1";
 constexpr const char * kTurkishDroneInitialPrompt =
         u8"Kartal drone komutları: havalan, kalk, uç, in, kalktığın yere in, eve dön, "
         u8"bulunduğun yere in, mevcut konuma in, bekleme noktasına in, "
@@ -35,6 +36,11 @@ constexpr const char * kTurkishDroneInitialPrompt =
         u8"gözlem yap, konuma git, marker bul, kırmızı çizgiyi bul, yeşil kareyi bul, "
         u8"mavi üçgeni bul, beyaz artı işaretini bul, dur, bekle, "
         u8"sabit kal, hareket etme.";
+
+// Reference/default profile: threads=4, max_tokens=0, audio_ctx=0 (model default).
+// The threads=6, max_tokens=48, audio_ctx=768 profile regressed both latency
+// and Turkish command recognition on the target Android device; do not use it
+// as the default without a separately measured experiment.
 
 using Clock = std::chrono::steady_clock;
 
@@ -379,6 +385,7 @@ Java_com_mehmet_sttbridge_STTBridge_whisperTranscribeNative(
     params.single_segment = true;
     params.max_len = 0;
     params.max_tokens = 0;
+    params.audio_ctx = 0;
     params.initial_prompt = kTurkishDroneInitialPrompt;
     params.carry_initial_prompt = false;
     params.temperature = 0.0F;
@@ -392,9 +399,17 @@ Java_com_mehmet_sttbridge_STTBridge_whisperTranscribeNative(
     __android_log_print(
             ANDROID_LOG_INFO,
             kLogTag,
-            "[WhisperConfig] language=%s translate=false temperature=0.0 noTimestamps=true "
-            "singleSegment=true maxLen=0 maxTokens=0 initialPrompt=turkish_drone_commands_v1 threads=%d",
+            "[WhisperConfig] language=%s translate=%s temperature=%.1f noContext=%s "
+            "noTimestamps=%s singleSegment=%s maxTokens=%d audioCtx=%d initialPrompt=%s threads=%d",
             language.c_str(),
+            params.translate ? "true" : "false",
+            static_cast<double>(params.temperature),
+            params.no_context ? "true" : "false",
+            params.no_timestamps ? "true" : "false",
+            params.single_segment ? "true" : "false",
+            params.max_tokens,
+            params.audio_ctx,
+            kTurkishDronePromptVersion,
             session->thread_count);
 
     const auto inference_started = Clock::now();
