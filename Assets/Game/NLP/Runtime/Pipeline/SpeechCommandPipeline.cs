@@ -200,6 +200,75 @@ namespace Game.NLP
             return result;
         }
 
+        /// <summary>
+        /// Runs the existing deterministic/recovery/evidence parser for N-best ranking.
+        /// This deliberately never calls the LLM, clears/replaces suggestions, raises Completed,
+        /// or advances the normal pipeline generation.
+        /// </summary>
+        public async Task<SpeechCommandCandidateProbe> EvaluateCandidateAsync(
+            string transcript,
+            string rawTranscript = "",
+            CancellationToken cancellationToken = default)
+        {
+            Stopwatch total = Stopwatch.StartNew();
+            string safeTranscript = transcript ?? string.Empty;
+            string safeRaw = string.IsNullOrWhiteSpace(rawTranscript) ? safeTranscript : rawTranscript;
+            string context = BuildAnalysisContextJson(ActiveConfigJson, safeRaw, "probe-" + Guid.NewGuid().ToString("N"));
+            string nlpJson = await analyzeAsync(safeTranscript, context, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            NlpAnalysisResult nlp = SafeFromJson<NlpAnalysisResult>(nlpJson);
+            ValidatedCommandResult baseline = DroneCommandJsonParser.ParseObjectForKey(nlpJson, "drone_command");
+            if (nlp != null) nlp.drone_command = baseline;
+            CommandRecoveryResult recovery = CommandRecoveryResult.From(nlp?.baseline_hints, safeTranscript);
+            bool baselineFinal = nlp?.baseline_hints != null && nlp.baseline_hints.final_parser && baseline != null;
+            bool evidence = HasAnyActionEvidence(nlp, recovery, baseline);
+            string action = IntendedAction(baseline);
+            bool missingInfo = string.Equals(baseline?.action, "MISSING_INFO", StringComparison.Ordinal);
+            bool confirmation = string.Equals(recovery.resolution_status, CommandRecoveryStatus.NeedsConfirmation, StringComparison.Ordinal);
+
+            int safetyRank;
+            string reason;
+            if (baselineFinal && !missingInfo && !string.IsNullOrWhiteSpace(action) && action != "UNKNOWN")
+            {
+                bool corrected = recovery.correction_applied
+                    || string.Equals(recovery.resolution_status, CommandRecoveryStatus.ResolvedAutoCorrection, StringComparison.Ordinal);
+                safetyRank = corrected ? 500 : 600;
+                reason = corrected ? "AUTO_CORRECTION_RESOLVED" : "DETERMINISTIC_RESOLVED";
+            }
+            else if (missingInfo && evidence)
+            {
+                safetyRank = 400;
+                reason = "SAFE_MISSING_INFO";
+            }
+            else if (confirmation)
+            {
+                safetyRank = 300;
+                reason = "NEEDS_CONFIRMATION";
+            }
+            else
+            {
+                safetyRank = evidence ? 200 : 100;
+                reason = evidence ? "ACTION_EVIDENCE_ONLY" : "UNKNOWN_OR_OUT_OF_DOMAIN";
+            }
+
+            return new SpeechCommandCandidateProbe
+            {
+                transcript = safeTranscript,
+                nlp = nlp,
+                recovery = recovery,
+                deterministic = baseline,
+                intendedAction = action,
+                safetyRank = safetyRank,
+                reason = reason,
+                hasActionEvidence = evidence,
+                evidenceStrength = nlp?.baseline_hints?.action_evidence?.supported_actions?.Length ?? 0,
+                recoveryConfidence = recovery.correction_confidence,
+                durationMs = total.ElapsedMilliseconds,
+                llmCalled = false,
+            };
+        }
+
         public async Task<SuggestionDecisionResult> ConfirmSuggestionAsync(
             string suggestionId,
             CancellationToken cancellationToken = default)
@@ -503,5 +572,22 @@ namespace Game.NLP
         public string finalResolutionStatus;
         public bool llmCalled;
         public long totalDurationMs;
+    }
+
+    [Serializable]
+    public sealed class SpeechCommandCandidateProbe
+    {
+        public string transcript;
+        public NlpAnalysisResult nlp;
+        public CommandRecoveryResult recovery;
+        public ValidatedCommandResult deterministic;
+        public string intendedAction;
+        public int safetyRank;
+        public string reason;
+        public bool hasActionEvidence;
+        public int evidenceStrength;
+        public double recoveryConfidence;
+        public long durationMs;
+        public bool llmCalled;
     }
 }

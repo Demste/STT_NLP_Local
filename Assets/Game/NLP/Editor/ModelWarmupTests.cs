@@ -20,9 +20,9 @@ namespace Game.NLP.EditorTests
         [Test]
         public async Task EnsureReadyTwiceInitializesEveryComponentOnce()
         {
-            int whisper = 0, python = 0, llm = 0;
+            int androidStt = 0, python = 0, llm = 0;
             ModelWarmupCoordinator coordinator = Coordinator(
-                () => { whisper++; return Task.FromResult(ReadyJson); },
+                () => { androidStt++; return Task.FromResult(ReadyJson); },
                 () => { python++; return Task.FromResult(ReadyJson); },
                 _ => { llm++; return Task.FromResult(ReadyJson); });
 
@@ -32,7 +32,7 @@ namespace Game.NLP.EditorTests
 
             Assert.AreSame(first, second);
             Assert.AreEqual(ModelWarmupState.Ready, result.state);
-            Assert.AreEqual(1, whisper);
+            Assert.AreEqual(1, androidStt);
             Assert.AreEqual(1, python);
             Assert.AreEqual(1, llm);
         }
@@ -40,9 +40,9 @@ namespace Game.NLP.EditorTests
         [Test]
         public async Task ConcurrentCallersAwaitSameSharedTask()
         {
-            TaskCompletionSource<string> whisperGate = NewGate();
+            TaskCompletionSource<string> androidSttGate = NewGate();
             ModelWarmupCoordinator coordinator = Coordinator(
-                () => whisperGate.Task,
+                () => androidSttGate.Task,
                 () => Task.FromResult(ReadyJson),
                 _ => Task.FromResult(ReadyJson));
 
@@ -51,7 +51,7 @@ namespace Game.NLP.EditorTests
             Assert.AreSame(first, second);
             Assert.AreEqual(ModelWarmupState.WarmingUp, coordinator.CurrentState);
 
-            whisperGate.SetResult(ReadyJson);
+            androidSttGate.SetResult(ReadyJson);
             Assert.AreEqual(ModelWarmupState.Ready, (await first).state);
         }
 
@@ -70,13 +70,13 @@ namespace Game.NLP.EditorTests
                 return ReadyJson;
             }
             ModelWarmupCoordinator coordinator = Coordinator(
-                () => Step("whisper"),
+                () => Step("android_stt"),
                 () => Step("python_spacy"),
                 _ => Step("llm"));
 
             await coordinator.EnsureReadyAsync("{}");
 
-            CollectionAssert.AreEqual(new[] { "whisper", "python_spacy", "llm" }, order);
+            CollectionAssert.AreEqual(new[] { "android_stt", "python_spacy", "llm" }, order);
         }
 
         [Test]
@@ -115,7 +115,7 @@ namespace Game.NLP.EditorTests
 
             controller.BeginHoldRecording();
 
-            StringAssert.Contains("Modeller hazırlanıyor", status.text);
+            StringAssert.Contains("Android konuşma tanıma hazırlanıyor", status.text);
             gate.SetResult(ReadyJson);
             await coordinator.EnsureReadyAsync("{}");
             UnityEngine.Object.DestroyImmediate(owner);
@@ -133,7 +133,7 @@ namespace Game.NLP.EditorTests
 
             Assert.AreEqual(ModelWarmupState.Failed, result.state);
             Assert.IsFalse(result.CanRecord);
-            Assert.AreEqual("whisper", result.failureComponent);
+            Assert.AreEqual("android_stt", result.failureComponent);
             StringAssert.Contains("forced failure", result.failureMessage);
         }
 
@@ -156,9 +156,9 @@ namespace Game.NLP.EditorTests
         [Test]
         public async Task RetryAfterPartialFailureRetriesOnlyFailedLlmOnce()
         {
-            int whisper = 0, python = 0, llm = 0;
+            int androidStt = 0, python = 0, llm = 0;
             ModelWarmupCoordinator coordinator = Coordinator(
-                () => { whisper++; return Task.FromResult(ReadyJson); },
+                () => { androidStt++; return Task.FromResult(ReadyJson); },
                 () => { python++; return Task.FromResult(ReadyJson); },
                 _ => { llm++; return Task.FromResult(llm == 1 ? FailedJson : ReadyJson); });
 
@@ -166,7 +166,7 @@ namespace Game.NLP.EditorTests
             Assert.AreEqual(ModelWarmupState.Ready, (await coordinator.RetryOnceAsync("{}")).state);
             await coordinator.RetryOnceAsync("{}");
 
-            Assert.AreEqual(1, whisper);
+            Assert.AreEqual(1, androidStt);
             Assert.AreEqual(1, python);
             Assert.AreEqual(2, llm);
         }
@@ -199,10 +199,106 @@ namespace Game.NLP.EditorTests
 
             ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}");
 
-            Assert.IsTrue(result.whisperContextReused);
+            Assert.IsFalse(result.whisperReady);
+            Assert.IsFalse(result.whisperContextReused);
             Assert.IsTrue(result.pythonRuntimeReused);
             Assert.IsTrue(result.spacyModelReused);
             Assert.IsTrue(result.llmModelReused);
+        }
+
+        [Test]
+        public async Task ActiveWarmupPreparesAndroidAndNeverMarksWhisperInitialized()
+        {
+            string requestedMode = null;
+            const string support = "{\"ok\":true,\"initialized\":true,\"stage\":\"android_speech_recognizer_ready\","
+                + "\"online_available\":true,\"on_device_service_available\":true,\"tr_tr_on_device_ready\":false,"
+                + "\"model_download_requested\":true,\"durationMs\":1}";
+            ModelWarmupCoordinator coordinator = new ModelWarmupCoordinator(
+                mode => { requestedMode = mode; return Task.FromResult(support); },
+                () => Task.FromResult(ReadyJson),
+                _ => Task.FromResult(ReadyJson));
+
+            ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}", "AUTO");
+
+            Assert.AreEqual("AUTO", requestedMode);
+            Assert.IsTrue(result.androidSpeechReady);
+            Assert.IsTrue(result.onlineSttReady);
+            Assert.IsTrue(result.onDeviceServiceAvailable);
+            Assert.IsFalse(result.offlineTurkishReady);
+            Assert.IsTrue(result.modelDownloadRequested);
+            Assert.IsFalse(result.whisperReady);
+            Assert.AreEqual(0, result.whisperDurationMs);
+        }
+
+        [Test]
+        public async Task CannotCheckSupportWithStandardServiceKeepsAutoWarmupReady()
+        {
+            const string supportUnknown = "{\"ok\":true,\"initialized\":true,"
+                + "\"stage\":\"android_speech_recognizer_ready\",\"standard_service_available\":true,"
+                + "\"online_support_status\":\"CHECK_UNAVAILABLE\",\"online_usable\":true,"
+                + "\"online_available\":true,\"on_device_service_available\":true,"
+                + "\"on_device_support_status\":\"UNAVAILABLE\",\"tr_tr_on_device_ready\":false,"
+                + "\"offline_usable\":false,\"selected_mode\":\"ONLINE\",\"warmup_success\":true,"
+                + "\"model_download_requested\":false,\"durationMs\":1,\"error\":\"\"}";
+            ModelWarmupCoordinator coordinator = new ModelWarmupCoordinator(
+                _ => Task.FromResult(supportUnknown),
+                () => Task.FromResult(ReadyJson),
+                _ => Task.FromResult(ReadyJson));
+
+            ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}", "AUTO");
+
+            Assert.AreEqual(ModelWarmupState.Ready, result.state);
+            Assert.IsTrue(result.CanRecord);
+            Assert.IsTrue(result.onlineSttReady);
+            Assert.AreEqual("CHECK_UNAVAILABLE", result.onlineSupportStatus);
+            Assert.AreEqual("ONLINE", result.selectedSttMode);
+            Assert.IsFalse(result.offlineTurkishReady);
+            Assert.IsFalse(result.modelDownloadRequested);
+            Assert.AreEqual(string.Empty, result.failureMessage);
+        }
+
+        [Test]
+        public async Task AutoStandardServiceIgnoresUnknownNetworkAndOfflineDownloadFailure()
+        {
+            const string support = "{\"ok\":true,\"initialized\":true,"
+                + "\"stage\":\"android_speech_recognizer_ready\",\"requested_mode\":\"AUTO\","
+                + "\"standard_service_available\":true,\"network_state\":\"UNKNOWN\","
+                + "\"network_validated\":\"unknown\",\"online_usable\":true,"
+                + "\"on_device_service_available\":true,\"tr_tr_on_device_ready\":false,"
+                + "\"offline_usable\":false,\"offline_model_status\":\"FAILED\","
+                + "\"selected_mode\":\"ONLINE\",\"selection_reason\":\"STANDARD_SERVICE_AVAILABLE\","
+                + "\"model_download_requested\":true,\"warmup_success\":true,\"durationMs\":1}";
+            ModelWarmupCoordinator coordinator = new ModelWarmupCoordinator(
+                _ => Task.FromResult(support),
+                () => Task.FromResult(ReadyJson),
+                _ => Task.FromResult(ReadyJson));
+
+            ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}", "AUTO");
+
+            Assert.AreEqual(ModelWarmupState.Ready, result.state);
+            Assert.IsTrue(result.CanRecord);
+            Assert.AreEqual("UNKNOWN", result.networkState);
+            Assert.AreEqual("unknown", result.networkValidated);
+            Assert.AreEqual("FAILED", result.offlineModelStatus);
+            Assert.AreEqual("ONLINE", result.selectedSttMode);
+            Assert.AreEqual("STANDARD_SERVICE_AVAILABLE", result.sttSelectionReason);
+        }
+
+        [Test]
+        public async Task GenuineAndroidSttFailureSkipsHeavyWarmups()
+        {
+            int pythonCalls = 0;
+            int llmCalls = 0;
+            ModelWarmupCoordinator coordinator = Coordinator(
+                () => Task.FromResult(FailedJson),
+                () => { pythonCalls++; return Task.FromResult(ReadyJson); },
+                _ => { llmCalls++; return Task.FromResult(ReadyJson); });
+
+            ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}");
+
+            Assert.AreEqual(ModelWarmupState.Failed, result.state);
+            Assert.AreEqual(0, pythonCalls);
+            Assert.AreEqual(0, llmCalls);
         }
 
         private static ModelWarmupCoordinator Coordinator(

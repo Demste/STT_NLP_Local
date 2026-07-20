@@ -29,6 +29,9 @@ namespace Game.STT
         [Header("Language")]
         [SerializeField] private string language = "tr";
 
+        [Header("Android Speech Recognizer")]
+        [SerializeField] private AndroidSpeechRecognitionMode speechRecognitionMode = AndroidSpeechRecognitionMode.AUTO;
+
         [Header("Recording")]
         [SerializeField] private int sampleRate = 16000;
         [SerializeField] private int maxRecordSeconds = 30;
@@ -50,10 +53,12 @@ namespace Game.STT
         [Header("Command Recovery UI")]
         [SerializeField] private SpeechCommandRecoveryView commandRecoveryView;
 
-        private readonly STTProvider _activeProvider = STTProvider.WhisperCppOffline;
+        private readonly STTProvider _activeProvider = STTProvider.AndroidSpeechRecognizer;
+        private const STTProvider LegacyWhisperProvider = STTProvider.WhisperCppOffline;
         private MicrophoneRecorder _recorder;
         private STTSessionStorage _storage;
         private STTAndroidBridgeClient _bridgeClient;
+        private IAndroidSpeechRecognizerClient _speechRecognizerClient;
         private string _lastWavPath;
         private string _lastRecordingLabel;
         private string _expectedProviderApi;
@@ -73,12 +78,18 @@ namespace Game.STT
         private string _lastCleanCommand = string.Empty;
         private ModelWarmupCoordinator _warmupCoordinator;
         private readonly Dictionary<int, RequestTiming> _requestTimings = new Dictionary<int, RequestTiming>();
+        private readonly Dictionary<int, AndroidSpeechCandidateSelection> _candidateSelections =
+            new Dictionary<int, AndroidSpeechCandidateSelection>();
+        private string _activeSpeechSessionId = string.Empty;
+        private bool _recognitionSessionActive;
+        private bool _controllerDestroyed;
+        private string _lastGlobalStatusMessage = string.Empty;
 
         private void Awake()
         {
-            _recorder = new MicrophoneRecorder(sampleRate, maxRecordSeconds);
             _storage = new STTSessionStorage(language);
             _bridgeClient = new STTAndroidBridgeClient();
+            _speechRecognizerClient = _bridgeClient;
             _warmupCoordinator = ModelWarmupCoordinator.Shared;
 
             SetupDropdown();
@@ -88,7 +99,7 @@ namespace Game.STT
                 shareTxtButton.onClick.AddListener(ShareTxt);
             }
 
-            SetStatus("Modeller hazırlanıyor...");
+            SetStatus("Android konuşma tanıma hazırlanıyor");
             SetRecordButtonInteractable(false);
             SetWhisperResult(string.Empty);
             SetNlpJsonResult(string.Empty);
@@ -121,6 +132,7 @@ namespace Game.STT
 
             CancelConfirmation();
             _pipelineCancellation?.Cancel();
+            CancelActiveSpeechSession();
         }
 
         private async void Start()
@@ -128,7 +140,8 @@ namespace Game.STT
             try
             {
                 ModelWarmupSnapshot result = await _warmupCoordinator.EnsureReadyAsync(
-                    speechCommandPipeline != null ? speechCommandPipeline.ActiveConfigJson : SpeechCommandPipelineConfig.DefaultConfigJson);
+                    speechCommandPipeline != null ? speechCommandPipeline.ActiveConfigJson : SpeechCommandPipelineConfig.DefaultConfigJson,
+                    speechRecognitionMode.ToString());
                 if (this != null && isActiveAndEnabled)
                 {
                     HandleWarmupProgress(result);
@@ -146,6 +159,7 @@ namespace Game.STT
 
         private void OnDestroy()
         {
+            _controllerDestroyed = true;
             if (shareTxtButton != null)
             {
                 shareTxtButton.onClick.RemoveListener(ShareTxt);
@@ -155,11 +169,18 @@ namespace Game.STT
             _pipelineCancellation?.Dispose();
             _confirmationCancellation?.Cancel();
             _confirmationCancellation?.Dispose();
+            CancelActiveSpeechSession();
+            _speechRecognizerClient?.DestroySpeechRecognizer();
         }
 
         private void OnApplicationQuit()
         {
-            _bridgeClient?.ReleaseWhisper();
+            _speechRecognizerClient?.DestroySpeechRecognizer();
+        }
+
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused) CancelActiveSpeechSession();
         }
 
         private void SetupDropdown()
@@ -186,16 +207,16 @@ namespace Game.STT
             {
                 if (warmup != null && warmup.state == ModelWarmupState.Failed)
                 {
-                    SetStatus("Model hazırlama başarısız: " + FirstNonEmpty(warmup.failureMessage, warmup.failureComponent));
+                    SetStatus("Sistem hazırlama başarısız: " + FirstNonEmpty(warmup.failureMessage, warmup.failureComponent));
                 }
                 else
                 {
-                    SetStatus("Modeller hazırlanıyor, lütfen bekleyin.");
+                    SetStatus("Android konuşma tanıma hazırlanıyor, lütfen bekleyin.");
                 }
                 return;
             }
 
-            if (_busy)
+            if (_busy || _recognitionSessionActive)
             {
                 SetStatus("Şu an işlem devam ediyor, bitince tekrar dene.");
                 return;
@@ -203,28 +224,197 @@ namespace Game.STT
 
             int requestId = StartNewRequest();
 
-            try
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
             {
-                _recorder.Start();
-                SetStatus("Ses kaydı başlatıldı", requestId);
-                SetWhisperResult(string.Empty, requestId);
-                SetNlpJsonResult(string.Empty, requestId);
-                SetTimingText(GetTiming(requestId), requestId);
+                UnityEngine.Android.Permission.RequestUserPermission(UnityEngine.Android.Permission.Microphone);
+                SetStatus("Mikrofon izni gerekli. İzin verdikten sonra tekrar basın.", requestId);
+                return;
             }
-            catch (Exception ex)
-            {
-                SetStatus("Hata: " + ex.Message, requestId);
-            }
+#endif
+            RequestTiming timing = GetTiming(requestId);
+            timing.totalStopwatch.Restart();
+            timing.pressAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _activeSpeechSessionId = "android-stt-" + requestId.ToString(CultureInfo.InvariantCulture)
+                + "-" + timing.pressAtUnixMs.ToString(CultureInfo.InvariantCulture);
+            _recognitionSessionActive = true;
+            SetStatus("Dinleniyor...", requestId);
+            SetWhisperResult(string.Empty, requestId);
+            SetNlpJsonResult(string.Empty, requestId);
+            SetTimingText(timing, requestId);
+            _speechRecognizerClient.StartSpeechRecognition(
+                _activeSpeechSessionId,
+                speechRecognitionMode,
+                gameObject.name,
+                nameof(OnAndroidSpeechRecognizerEvent));
         }
 
         public void EndHoldRecordingAndTranscribeSelected()
         {
-            if (_busy)
+            if (!_recognitionSessionActive || _busy || string.IsNullOrWhiteSpace(_activeSpeechSessionId))
             {
                 return;
             }
+            _busy = true;
+            RequestTiming timing = GetTiming(_activeRequestId);
+            timing.releaseAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            SetRecordButtonInteractable(false);
+            SetStatus("Ses işleniyor...", _activeRequestId);
+            _speechRecognizerClient.StopSpeechRecognition(_activeSpeechSessionId);
+        }
 
-            StartCoroutine(CoStopSaveTranscribeAndParse(_activeRequestId));
+        public void OnAndroidSpeechRecognizerEvent(string json)
+        {
+            if (_controllerDestroyed) return;
+            AndroidSpeechRecognitionEvent speechEvent;
+            try
+            {
+                speechEvent = JsonUtility.FromJson<AndroidSpeechRecognitionEvent>(json);
+            }
+            catch (Exception ex)
+            {
+                HandleAndroidSpeechError(_activeRequestId, "Konuşma tanıma sonucu okunamadı: " + ex.Message, "JSON_PARSE");
+                return;
+            }
+
+            if (speechEvent == null || !string.Equals(speechEvent.session_id, _activeSpeechSessionId, StringComparison.Ordinal))
+            {
+                Debug.LogWarning("[AndroidSTT] stale callback ignored session_id=" + (speechEvent?.session_id ?? "null"));
+                return;
+            }
+
+            int requestId = _activeRequestId;
+            RequestTiming timing = GetTiming(requestId);
+            ApplyAndroidTiming(timing, speechEvent);
+            if (string.Equals(speechEvent.event_type, "PARTIAL", StringComparison.Ordinal))
+            {
+                string partial = speechEvent.alternatives != null && speechEvent.alternatives.Length > 0
+                    ? speechEvent.alternatives[0]?.text ?? string.Empty : string.Empty;
+                if (!string.IsNullOrWhiteSpace(partial))
+                {
+                    SetWhisperResult(partial, requestId);
+                    Debug.Log($"[AndroidSTTPartial] session_id={speechEvent.session_id} elapsed_ms={ElapsedSince(timing.pressAtUnixMs)} text=\"{EscapeForLog(partial)}\"");
+                }
+                return;
+            }
+
+            if (string.Equals(speechEvent.event_type, "ERROR", StringComparison.Ordinal))
+            {
+                HandleAndroidSpeechError(requestId,
+                    FirstNonEmpty(speechEvent.error_message, "Konuşma tanıma başlatılamadı; tekrar deneyin."),
+                    speechEvent.error_name);
+                return;
+            }
+
+            if (string.Equals(speechEvent.event_type, "FINAL", StringComparison.Ordinal))
+            {
+                _recognitionSessionActive = false;
+                HandleAndroidFinalAsync(speechEvent, requestId);
+            }
+        }
+
+        private async void HandleAndroidFinalAsync(AndroidSpeechRecognitionEvent speechEvent, int requestId)
+        {
+            try
+            {
+                if (speechEvent.alternatives == null || speechEvent.alternatives.Length == 0)
+                {
+                    HandleAndroidSpeechError(requestId, "Konuşma anlaşılamadı", "ERROR_NO_MATCH");
+                    return;
+                }
+                _pipelineCancellation?.Cancel();
+                _pipelineCancellation?.Dispose();
+                _pipelineCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(PipelineTimeoutSeconds));
+                AndroidSpeechCandidateSelection selection = await AndroidSpeechCandidateSelector.SelectAsync(
+                    speechEvent.alternatives,
+                    suffix => speechCommandPipeline != null
+                        ? speechCommandPipeline.EvaluateCandidateAsync(suffix, suffix, _pipelineCancellation.Token)
+                        : Task.FromResult<SpeechCommandCandidateProbe>(null),
+                    _pipelineCancellation.Token);
+                if (!IsLatestRequest(requestId) || _controllerDestroyed) return;
+                _candidateSelections[requestId] = selection;
+                RequestTiming timing = GetTiming(requestId);
+                timing.nbestEvaluationMs = selection.evaluationDurationMs;
+                Debug.Log(
+                    $"[AndroidSTTFinal] session_id={speechEvent.session_id} alternatives={speechEvent.alternatives.Length} "
+                    + $"primary=\"{EscapeForLog(selection.recognizerPrimaryTranscript)}\" selected=\"{EscapeForLog(selection.selectedTranscript)}\" "
+                    + $"selected_index={selection.selectedCandidateIndex} android_confidence={FormatConfidence(selection.selectedAndroidConfidence, selection.selectedAndroidConfidenceAvailable)} "
+                    + $"confidence_available={BoolText(selection.selectedAndroidConfidenceAvailable)} selection_reason={selection.candidateSelectionReason} "
+                    + $"finalization_latency_ms={speechEvent.finalization_latency_ms} nbest_evaluation_ms={selection.evaluationDurationMs}");
+                StartCoroutine(CoHandleAndroidFinal(selection, requestId));
+            }
+            catch (OperationCanceledException)
+            {
+                if (IsLatestRequest(requestId)) HandleAndroidSpeechError(requestId, "Konuşma işleme zaman aşımına uğradı.", "CANCELLED");
+            }
+            catch (Exception ex)
+            {
+                if (IsLatestRequest(requestId)) HandleAndroidSpeechError(requestId, "Konuşma sonucu işlenemedi: " + ex.Message, "NBEST_ERROR");
+            }
+        }
+
+        private IEnumerator CoHandleAndroidFinal(AndroidSpeechCandidateSelection selection, int requestId)
+        {
+            string transcript = selection?.selectedTranscript?.Trim() ?? string.Empty;
+            SetWhisperResult(transcript, requestId);
+            if (string.IsNullOrWhiteSpace(transcript))
+            {
+                FinishWithoutNlp(requestId, GetTiming(requestId), NoDroneCommandMessage, NoDroneCommandMessage, WakeWordParseResult.NoWakeWord);
+                FinishAndroidSession();
+                yield break;
+            }
+
+            RequestTiming timing = GetTiming(requestId);
+            timing.wakeWordStopwatch.Restart();
+            WakeWordParseResult wakeWordResult = TryExtractCommandAfterWakeWord(transcript);
+            timing.wakeWordStopwatch.Stop();
+            timing.wakeWordSeconds = timing.wakeWordStopwatch.Elapsed.TotalSeconds;
+            timing.hasWakeWordTiming = true;
+            timing.wakeResult = wakeWordResult;
+            LogWakeWordDuration(requestId, timing.wakeWordSeconds, wakeWordResult);
+            if (!wakeWordResult.foundWakeWord || !wakeWordResult.hasCommand)
+            {
+                string message = wakeWordResult.foundWakeWord ? MissingCommandMessage : NoDroneCommandMessage;
+                FinishWithoutNlp(requestId, timing, message, message, wakeWordResult);
+                FinishAndroidSession();
+                yield break;
+            }
+            yield return CoRunNlp(wakeWordResult.cleanedCommand, transcript, requestId);
+            FinishAndroidSession();
+        }
+
+        private void FinishAndroidSession()
+        {
+            _busy = false;
+            _recognitionSessionActive = false;
+            _activeSpeechSessionId = string.Empty;
+            SetRecordButtonInteractable(true);
+        }
+
+        private void HandleAndroidSpeechError(int requestId, string message, string errorName)
+        {
+            _recognitionSessionActive = false;
+            _busy = false;
+            RequestTiming timing = GetTiming(requestId);
+            if (timing.totalStopwatch.IsRunning) CompleteTotalTiming(timing, message);
+            timing.nlpSkipped = true;
+            SetTimingText(timing, requestId);
+            SetStatus(message, requestId);
+            SetNlpJsonResult(string.Empty, requestId);
+            SetRecordButtonInteractable(true);
+            Debug.LogError($"[AndroidSTTError] session_id={_activeSpeechSessionId} error_name={errorName} user_message=\"{EscapeForLog(message)}\"");
+            _activeSpeechSessionId = string.Empty;
+        }
+
+        private void CancelActiveSpeechSession()
+        {
+            if (_recognitionSessionActive && !string.IsNullOrWhiteSpace(_activeSpeechSessionId))
+            {
+                _speechRecognizerClient?.CancelSpeechRecognition(_activeSpeechSessionId);
+            }
+            _recognitionSessionActive = false;
+            _busy = false;
+            _activeSpeechSessionId = string.Empty;
         }
 
         private IEnumerator CoStopSaveTranscribeAndParse(int requestId)
@@ -289,7 +479,7 @@ namespace Game.STT
 
         private IEnumerator CoTranscribeWhisperAndHandleResult(int requestId)
         {
-            _expectedProviderApi = _activeProvider.ToApiValue();
+            _expectedProviderApi = LegacyWhisperProvider.ToApiValue();
             _expectedAudioPath = _lastWavPath;
             _pendingCompleted = false;
             _pendingResult = null;
@@ -299,7 +489,7 @@ namespace Game.STT
             timing.totalStopwatch.Restart();
             timing.whisperStopwatch.Restart();
             _bridgeClient.Transcribe(
-                _activeProvider,
+                LegacyWhisperProvider,
                 _lastWavPath,
                 language,
                 gameObject.name,
@@ -332,7 +522,7 @@ namespace Game.STT
                 result = BuildErrorResult("Bridge result null döndü.");
             }
 
-            _storage.AppendModelOutput(_activeProvider, result);
+            _storage.AppendModelOutput(LegacyWhisperProvider, result);
 
             if (result.HasError)
             {
@@ -466,6 +656,18 @@ namespace Game.STT
             }
 
             SpeechCommandPipelineResult pipelineResult = pipelineTask.Result;
+            if (_candidateSelections.TryGetValue(requestId, out AndroidSpeechCandidateSelection selection)
+                && pipelineResult?.validated != null)
+            {
+                pipelineResult.validated.stt_confidence_level = AndroidSttConfidence.ToLevel(
+                    selection.selectedAndroidConfidence,
+                    selection.selectedAndroidConfidenceAvailable);
+                if (string.IsNullOrWhiteSpace(pipelineResult.validated.voice_type))
+                {
+                    pipelineResult.validated.voice_type = "NORMAL";
+                }
+                pipelineResult.finalJson = DroneCommandJsonParser.ToPublicJson(pipelineResult.validated);
+            }
             _lastCleanCommand = cleanCommand;
             string uiJson = RenderPipelineResult(cleanCommand, pipelineResult, requestId);
             Debug.Log($"[UI] request_id={requestId} writing_result={SummarizeForLog(uiJson)}");
@@ -572,7 +774,7 @@ namespace Game.STT
         {
             return new STTResult
             {
-                provider = _activeProvider.ToApiValue(),
+                provider = LegacyWhisperProvider.ToApiValue(),
                 language = language,
                 text = string.Empty,
                 durationMs = 0,
@@ -820,6 +1022,15 @@ namespace Game.STT
                 return;
             }
 
+            if (requestId == 0 && string.Equals(_lastGlobalStatusMessage, message, StringComparison.Ordinal))
+            {
+                return;
+            }
+            if (requestId == 0)
+            {
+                _lastGlobalStatusMessage = message ?? string.Empty;
+            }
+
             if (statusText != null)
             {
                 statusText.text = message;
@@ -843,7 +1054,7 @@ namespace Game.STT
             string value = string.IsNullOrWhiteSpace(transcript)
                 ? EmptyTranscriptMessage
                 : transcript.Trim();
-            transcriptText.text = "Whisper Result:\n" + value;
+            transcriptText.text = "Konuşma Sonucu:\n" + value;
         }
 
         private void SetNlpJsonResult(string value, int requestId = 0)
@@ -873,7 +1084,10 @@ namespace Game.STT
 
             timingText.text =
                 "Timing:\n" +
-                "Whisper: " + FormatTimingValue(timing.whisperSeconds, timing.hasWhisperTiming) + "\n" +
+                "Android STT: " + FormatTimingValue(timing.androidSttSeconds, timing.hasAndroidSttTiming) + "\n" +
+                "Release→final: " + FormatMilliseconds(timing.releaseToFinalMs) + "\n" +
+                "First partial: " + FormatMilliseconds(timing.firstPartialLatencyMs) + "\n" +
+                "N-best: " + FormatMilliseconds(timing.nbestEvaluationMs) + "\n" +
                 "Wake word: " + FormatTimingValue(timing.wakeWordSeconds, timing.hasWakeWordTiming) + "\n" +
                 "NLP: " + (timing.nlpSkipped ? SkippedText : FormatTimingValue(timing.nlpSeconds, timing.hasNlpTiming)) + "\n" +
                 "Total: " + FormatTimingValue(timing.totalSeconds, timing.hasTotalTiming) + "\n" +
@@ -902,15 +1116,15 @@ namespace Game.STT
                 case ModelWarmupState.WarmingUp:
                     string component = warmup.currentComponent switch
                     {
-                        "whisper" => "Whisper",
+                        "android_stt" => "Android konuşma tanıma",
                         "python_spacy" => "NLP",
                         "llm" => "LLM",
                         _ => "modeller",
                     };
-                    SetStatus("Modeller hazırlanıyor: " + component);
+                    SetStatus("Sistem hazırlanıyor: " + component);
                     break;
                 case ModelWarmupState.Ready:
-                    SetStatus("Sistem hazır");
+                    SetStatus("Sistem hazır — " + ReadyModeText(warmup));
                     break;
                 case ModelWarmupState.PartiallyReady:
                     SetStatus("Sistem kısmen hazır: " + FirstNonEmpty(warmup.failureComponent, "LLM"));
@@ -1146,6 +1360,53 @@ namespace Game.STT
             return hasValue ? FormatSeconds(seconds) : "-";
         }
 
+        private static string FormatMilliseconds(long milliseconds)
+        {
+            return milliseconds >= 0 ? milliseconds.ToString(CultureInfo.InvariantCulture) + " ms" : "-";
+        }
+
+        private static string FormatConfidence(float confidence, bool available)
+        {
+            return available && confidence >= 0f
+                ? confidence.ToString("0.00", CultureInfo.InvariantCulture)
+                : "unavailable";
+        }
+
+        private static long ElapsedSince(long unixMs)
+        {
+            return unixMs > 0 ? Math.Max(0L, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - unixMs) : -1L;
+        }
+
+        private static string ReadyModeText(ModelWarmupSnapshot warmup)
+        {
+            if (warmup == null) return "Android STT";
+            if (string.Equals(warmup.selectedSttMode, "ONLINE", StringComparison.Ordinal)) return "Online";
+            if (string.Equals(warmup.selectedSttMode, "OFFLINE", StringComparison.Ordinal)) return "Offline";
+            if (warmup.onlineSttReady && warmup.offlineSttUsable) return "Online / Offline";
+            if (warmup.onlineSttReady) return "Online";
+            if (warmup.offlineSttUsable || warmup.offlineTurkishReady) return "Offline";
+            return "Android STT";
+        }
+
+        private static void ApplyAndroidTiming(RequestTiming timing, AndroidSpeechRecognitionEvent speechEvent)
+        {
+            if (timing == null || speechEvent == null) return;
+            if (speechEvent.listening_started_at > 0 && speechEvent.final_result_at > 0)
+            {
+                timing.androidSttSeconds = Math.Max(0d,
+                    (speechEvent.final_result_at - speechEvent.listening_started_at) / 1000d);
+                timing.hasAndroidSttTiming = true;
+            }
+            if (timing.releaseAtUnixMs > 0 && speechEvent.final_result_at > 0)
+            {
+                timing.releaseToFinalMs = Math.Max(0L, speechEvent.final_result_at - timing.releaseAtUnixMs);
+            }
+            if (timing.pressAtUnixMs > 0 && speechEvent.first_partial_at > 0)
+            {
+                timing.firstPartialLatencyMs = Math.Max(0L, speechEvent.first_partial_at - timing.pressAtUnixMs);
+            }
+        }
+
         private static string FormatSeconds(double seconds)
         {
             return seconds.ToString("0.00", CultureInfo.InvariantCulture) + "s";
@@ -1253,15 +1514,22 @@ namespace Game.STT
             public readonly Stopwatch wakeWordStopwatch = new Stopwatch();
             public readonly Stopwatch nlpStopwatch = new Stopwatch();
             public double whisperSeconds;
+            public double androidSttSeconds;
             public double wakeWordSeconds;
             public double nlpSeconds;
             public double totalSeconds;
             public bool hasWhisperTiming;
+            public bool hasAndroidSttTiming;
             public bool hasWakeWordTiming;
             public bool hasNlpTiming;
             public bool hasTotalTiming;
             public bool nlpSkipped;
             public string finalStatus = string.Empty;
+            public long pressAtUnixMs;
+            public long releaseAtUnixMs;
+            public long releaseToFinalMs = -1;
+            public long firstPartialLatencyMs = -1;
+            public long nbestEvaluationMs = -1;
             public WakeWordParseResult wakeResult = WakeWordParseResult.NoWakeWord;
         }
     }

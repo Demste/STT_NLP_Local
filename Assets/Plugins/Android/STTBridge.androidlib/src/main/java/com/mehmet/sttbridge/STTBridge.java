@@ -58,6 +58,28 @@ public final class STTBridge {
 
     private STTBridge() {}
 
+    // Backwards-compatible entry points for the active Android system recognizer.
+    public static String prepareSpeechRecognizer(String requestedMode) {
+        return AndroidSpeechRecognizerBridge.prepareSpeechRecognizer(requestedMode);
+    }
+
+    public static void startSpeechRecognition(String sessionId, String requestedMode,
+                                              String unityGameObject, String unityCallbackMethod) {
+        AndroidSpeechRecognizerBridge.startListening(sessionId, requestedMode, unityGameObject, unityCallbackMethod);
+    }
+
+    public static void stopSpeechRecognition(String sessionId) {
+        AndroidSpeechRecognizerBridge.stopListening(sessionId);
+    }
+
+    public static void cancelSpeechRecognition(String sessionId) {
+        AndroidSpeechRecognizerBridge.cancel(sessionId);
+    }
+
+    public static void destroySpeechRecognizer() {
+        AndroidSpeechRecognizerBridge.destroy();
+    }
+
     public static boolean exportFileToPublicDocuments(final String sourcePath, final String sessionId, final String mimeType) {
         Activity activity = getUnityActivity();
 
