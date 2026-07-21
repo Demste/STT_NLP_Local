@@ -58,7 +58,7 @@ ACTION_PHRASES = {
     "STOP": ("dur", "bekle", "sabit kal", "hareket etme"),
 }
 
-# Exact, allowlisted Whisper errors. Keys are normalized by command_recovery;
+# Exact, allowlisted STT errors. Keys are normalized by command_recovery;
 # values are deliberately narrow corrections, not general spell checking.
 KNOWN_STT_VARIANTS = {
     "ev edin": "eve dön",

@@ -199,15 +199,13 @@ namespace Game.NLP.EditorTests
 
             ModelWarmupSnapshot result = await coordinator.EnsureReadyAsync("{}");
 
-            Assert.IsFalse(result.whisperReady);
-            Assert.IsFalse(result.whisperContextReused);
             Assert.IsTrue(result.pythonRuntimeReused);
             Assert.IsTrue(result.spacyModelReused);
             Assert.IsTrue(result.llmModelReused);
         }
 
         [Test]
-        public async Task ActiveWarmupPreparesAndroidAndNeverMarksWhisperInitialized()
+        public async Task ActiveWarmupPreparesAndroidSpeechRecognizer()
         {
             string requestedMode = null;
             const string support = "{\"ok\":true,\"initialized\":true,\"stage\":\"android_speech_recognizer_ready\","
@@ -226,8 +224,6 @@ namespace Game.NLP.EditorTests
             Assert.IsTrue(result.onDeviceServiceAvailable);
             Assert.IsFalse(result.offlineTurkishReady);
             Assert.IsTrue(result.modelDownloadRequested);
-            Assert.IsFalse(result.whisperReady);
-            Assert.AreEqual(0, result.whisperDurationMs);
         }
 
         [Test]
@@ -302,11 +298,11 @@ namespace Game.NLP.EditorTests
         }
 
         private static ModelWarmupCoordinator Coordinator(
-            Func<Task<string>> whisper,
+            Func<Task<string>> androidSpeech,
             Func<Task<string>> python,
             Func<string, Task<string>> llm)
         {
-            return new ModelWarmupCoordinator(whisper, python, llm);
+            return new ModelWarmupCoordinator(androidSpeech, python, llm);
         }
 
         private static TaskCompletionSource<string> NewGate()

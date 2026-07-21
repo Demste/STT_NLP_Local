@@ -17,38 +17,6 @@ namespace Game.STT
     {
         private const string BridgeClassName = "com.mehmet.sttbridge.STTBridge";
 
-        public void Transcribe(
-            STTProvider provider,
-            string wavPath,
-            string language,
-            string unityGameObjectName,
-            string unityCallbackMethod)
-        {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
-            bridge.CallStatic(
-                "transcribe",
-                provider.ToApiValue(),
-                wavPath,
-                language,
-                unityGameObjectName,
-                unityCallbackMethod
-            );
-#else
-            string json = JsonUtility.ToJson(new STTResult
-            {
-                provider = provider.ToApiValue(),
-                language = language,
-                text = string.Empty,
-                durationMs = 0,
-                audioFile = wavPath,
-                error = "Android bridge sadece Android cihaz/build içinde çalışır. Editor/PC için ayrı proxy gerekir."
-            });
-            GameObject target = GameObject.Find(unityGameObjectName);
-            if (target != null) target.SendMessage(unityCallbackMethod, json, SendMessageOptions.DontRequireReceiver);
-#endif
-        }
-
         public bool ShareTextFile(string txtPath)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
@@ -66,14 +34,6 @@ namespace Game.STT
             return bridge.CallStatic<bool>("exportFileToPublicDocuments", sourcePath, sessionId, mimeType);
 #else
             return false;
-#endif
-        }
-
-        public void ReleaseWhisper()
-        {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
-            bridge.CallStatic("releaseWhisper");
 #endif
         }
 
@@ -142,28 +102,35 @@ namespace Game.STT
 #endif
         }
 
-        public Task<string> WarmUpWhisperAsync(CancellationToken cancellationToken = default)
+        public void ForceRequestTurkishOnDeviceModel()
         {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            return Task.Run(() =>
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                AndroidJNI.AttachCurrentThread();
-                try
-                {
-                    using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
-                    string result = bridge.CallStatic<string>("warmUpWhisper");
-                    cancellationToken.ThrowIfCancellationRequested();
-                    return result ?? string.Empty;
-                }
-                finally
-                {
-                    AndroidJNI.DetachCurrentThread();
-                }
-            }, cancellationToken);
-#else
-            return Task.FromResult("{\"ok\":true,\"stage\":\"editor_noop\",\"initialized\":true,\"context_reused\":true,\"durationMs\":0}");
+#if UNITY_ANDROID && !UNITY_EDITOR && DEVELOPMENT_BUILD
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            bridge.CallStatic("forceRequestTurkishOnDeviceModel");
 #endif
         }
+
+        public string RequestTurkishOnDeviceModel(string unityGameObjectName, string unityCallbackMethod)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            return bridge.CallStatic<string>("requestTurkishOnDeviceModel", unityGameObjectName, unityCallbackMethod)
+                ?? string.Empty;
+#else
+            return "{\"ok\":true,\"model_status\":\"INSTALLED\",\"network_validated\":true}";
+#endif
+        }
+
+        public string ObserveTurkishOnDeviceModel(string unityGameObjectName, string unityCallbackMethod)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
+            return bridge.CallStatic<string>("observeTurkishOnDeviceModel", unityGameObjectName, unityCallbackMethod)
+                ?? string.Empty;
+#else
+            return "{\"ok\":true,\"model_status\":\"INSTALLED\",\"network_validated\":true}";
+#endif
+        }
+
     }
 }

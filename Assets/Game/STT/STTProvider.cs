@@ -2,8 +2,7 @@ namespace Game.STT
 {
     public enum STTProvider
     {
-        WhisperCppOffline = 0,
-        AndroidSpeechRecognizer = 1,
+        AndroidSpeechRecognizer = 0,
     }
 
     public static class STTProviderExtensions
@@ -12,9 +11,8 @@ namespace Game.STT
         {
             return provider switch
             {
-                STTProvider.WhisperCppOffline => "whisper_cpp_offline",
                 STTProvider.AndroidSpeechRecognizer => "android_speech_recognizer",
-                _ => "whisper_cpp_offline"
+                _ => "android_speech_recognizer"
             };
         }
 
@@ -22,7 +20,6 @@ namespace Game.STT
         {
             return provider switch
             {
-                STTProvider.WhisperCppOffline => "Whisper.cpp Offline",
                 STTProvider.AndroidSpeechRecognizer => "Android SpeechRecognizer",
                 _ => provider.ToString()
             };

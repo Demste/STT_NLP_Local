@@ -6,6 +6,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.net.ConnectivityManager;
@@ -17,7 +18,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.speech.RecognitionListener;
-import android.speech.ModelDownloadListener;
 import android.speech.RecognitionSupport;
 import android.speech.RecognitionSupportCallback;
 import android.speech.RecognizerIntent;
@@ -45,14 +45,10 @@ public final class AndroidSpeechRecognizerBridge {
     private static final String LANGUAGE = "tr-TR";
     private static final int MAX_RESULTS = 5;
     private static final long SUPPORT_TIMEOUT_MS = 7000L;
-    private static final long MODEL_RECHECK_DELAY_MS = 15000L;
-    private static final long MODEL_REQUEST_RETRY_MS = 24L * 60L * 60L * 1000L;
-    private static final long MODEL_FAILURE_RETRY_MS = 6L * 60L * 60L * 1000L;
-    private static final String MODEL_PREFS = "android_stt_model_download";
-    private static final String PREF_REQUESTED_AT = "requested_at";
-    private static final String PREF_LAST_RESULT = "last_result";
-    private static final String PREF_LAST_ERROR = "last_error";
-    private static final String PREF_LANGUAGE_TAG = "language_tag";
+    private static final long MODEL_POLL_INTERVAL_MS = 5000L;
+    private static final int MODEL_POLL_LIMIT = 60;
+    private static final long MODEL_DOWNLOAD_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
+    private static final String MODEL_PREFS = "android_stt_model_state";
     private static final Object LOCK = new Object();
 
     private enum State { IDLE, STARTING, LISTENING, STOPPING, WAITING_FINAL_RESULT, COMPLETED, CANCELLED, ERROR, DESTROYED }
@@ -70,7 +66,6 @@ public final class AndroidSpeechRecognizerBridge {
     private static SupportStatus onDeviceSupportStatus = SupportStatus.UNKNOWN;
     private static boolean supportChecked;
     private static boolean modelDownloadRequested;
-    private static boolean forcedModelDownloadRetryUsed;
     private static boolean onlineBiasingSupported;
     private static boolean offlineBiasingSupported;
     private static boolean onlineFormattingSupported;
@@ -82,6 +77,13 @@ public final class AndroidSpeechRecognizerBridge {
     private static String networkValidated = "unknown";
     private static String offlineModelStatus = "UNKNOWN";
     private static String supportMessage = "";
+    private static int modelPollCount;
+    private static boolean modelPollScheduled;
+    private static boolean modelDownloadInFlight;
+    private static SpeechRecognizer modelDownloadRecognizer;
+    private static long modelDownloadStartedAt;
+    private static String modelUnityGameObject = "";
+    private static String modelUnityCallbackMethod = "";
 
     private AndroidSpeechRecognizerBridge() {}
 
@@ -116,7 +118,7 @@ public final class AndroidSpeechRecognizerBridge {
         NetworkDiagnostics network = networkDiagnostics(activity);
         networkState = network.state;
         networkValidated = network.validated;
-        offlineModelStatus = readModelResult(activity);
+        offlineModelStatus = readModelState(activity);
 
         if (Build.VERSION.SDK_INT >= 33) {
             if (standardServiceAvailable) checkApi33OnlineSupport(activity);
@@ -128,9 +130,6 @@ public final class AndroidSpeechRecognizerBridge {
 
         if (trTurkishOnDeviceReady) {
             offlineModelStatus = "INSTALLED";
-            persistModelResult(activity, "INSTALLED", 0, false);
-        } else if (onDeviceServiceAvailable) {
-            requestOfflineModelDownload(activity, false, "STARTUP_SUPPORT_CHECK");
         } else if (Build.VERSION.SDK_INT < 33) {
             offlineModelStatus = "UNSUPPORTED_API";
             Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
@@ -139,21 +138,26 @@ public final class AndroidSpeechRecognizerBridge {
         }
 
         String selected = selectModeNameForTesting(
-                requested.name(), network.validatedInternet, onlineUsable,
+                requested.name(), network.state, network.validated, onlineUsable,
                 Build.VERSION.SDK_INT, onDeviceServiceAvailable, offlineUsable);
         selectedWarmupMode = selected;
-        selectionReason = selectionReasonForTesting(requested.name(), onlineUsable,
+        selectionReason = selectionReasonForTesting(requested.name(), network.state, network.validated, onlineUsable,
                 Build.VERSION.SDK_INT, onDeviceServiceAvailable, offlineUsable);
         boolean requestedReady = !selected.isEmpty();
         if (requested == Mode.OFFLINE && Build.VERSION.SDK_INT < 31) {
             supportMessage = "Android 12 (API 31) öncesinde çevrimdışı tanıma desteklenmiyor.";
-        } else if (requested == Mode.OFFLINE && !offlineUsable) {
-            supportMessage = "Türkçe çevrimdışı konuşma modeli hazır değil. Sistem dil paketini indirin.";
+        } else if (requested == Mode.OFFLINE && !onDeviceServiceAvailable) {
+            supportMessage = "Cihazda çevrimdışı konuşma tanıma servisi bulunamadı.";
         } else if ((requested == Mode.AUTO || requested == Mode.ONLINE) && onlineUsable) {
             // Offline model state must never block an otherwise usable standard recognizer.
             supportMessage = "";
         } else if (!requestedReady && supportMessage.isEmpty()) {
             supportMessage = "Konuşma tanıma servisi cihazda bulunamadı.";
+        }
+        // Warm-up only reports state. A download starts after explicit Unity UI consent.
+        if (Build.VERSION.SDK_INT >= 33
+                && ("PENDING".equals(offlineModelStatus) || "REQUESTED".equals(offlineModelStatus))) {
+            scheduleModelPoll(activity);
         }
         Log.i(TAG, String.format(Locale.US,
                 "[AndroidSTTSupport] requested_mode=%s standard_service_available=%s network_state=%s network_validated=%s "
@@ -261,9 +265,13 @@ public final class AndroidSpeechRecognizerBridge {
                                 || hasAnyLanguage(support.getPendingOnDeviceLanguages());
                         supportChecked = true;
                         if (trTurkishOnDeviceReady) {
+                            persistModelState(activity, "INSTALLED");
+                            offlineModelStatus = "INSTALLED";
                             offlineUsable = true;
                             onDeviceSupportStatus = SupportStatus.SUPPORTED;
                         } else if (downloadable || pending) {
+                            offlineModelStatus = pending ? "PENDING" : "DOWNLOAD_REQUIRED";
+                            persistModelState(activity, offlineModelStatus);
                             offlineUsable = false;
                             onDeviceSupportStatus = SupportStatus.UNAVAILABLE;
                         } else if (hasAnyLanguageDetail) {
@@ -273,11 +281,11 @@ public final class AndroidSpeechRecognizerBridge {
                             offlineUsable = onDeviceServiceAvailable;
                             onDeviceSupportStatus = SupportStatus.UNKNOWN;
                         }
-                        if (requested == Mode.OFFLINE && !offlineUsable) {
-                            supportMessage = pending
-                                    ? "Türkçe çevrimdışı model indirmesi sistem tarafından planlandı."
-                                    : "Türkçe çevrimdışı konuşma modeli hazır değil. Sistem dil paketini indirin.";
-                        }
+                        // Do not turn advisory language lists into a hard gate. The user may
+                        // already have the model installed in the selected recognition service.
+                        if (requested == Mode.OFFLINE) supportMessage = "";
+                        logModelStatus(activity, "SUPPORT_RESULT", trTurkishOnDeviceReady,
+                                pending, downloadable, !trTurkishOnDeviceReady && downloadable);
                         if (trTurkishOnDeviceReady) {
                             checkOptionalExtrasSupport(recognizer, activity, Mode.OFFLINE, latch);
                         } else {
@@ -295,16 +303,17 @@ public final class AndroidSpeechRecognizerBridge {
                             offlineUsable = onDeviceServiceAvailable;
                             supportMessage = "";
                         } else if (isLanguageError(error)) {
-                            offlineUsable = false;
-                            if (requested == Mode.OFFLINE) {
-                                supportMessage = error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
-                                        ? "Türkçe çevrimdışı konuşma bu serviste desteklenmiyor."
-                                        : "Türkçe çevrimdışı konuşma modeli hazır değil. Sistem dil paketini indirin.";
-                            }
+                            // Session callbacks from a real on-device start are authoritative.
+                            offlineUsable = onDeviceServiceAvailable;
+                            supportMessage = "";
+                            offlineModelStatus = "DOWNLOAD_REQUIRED";
+                            persistModelState(activity, offlineModelStatus);
                         } else {
                             offlineUsable = onDeviceServiceAvailable;
                             supportMessage = "";
                         }
+                        logModelStatus(activity, errorName(error), false, false, false,
+                                isLanguageError(error));
                         latch.countDown();
                     }
                 });
@@ -365,12 +374,13 @@ public final class AndroidSpeechRecognizerBridge {
                         SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS, "Mikrofon izni verilmedi.");
                 return;
             }
+            refreshRecognizerAvailability(activity);
             Mode used = chooseMode(activity, requested);
             if (used == null) {
                 String error = requested == Mode.OFFLINE
                         ? (Build.VERSION.SDK_INT < 31
                             ? "Bu cihazda çevrimdışı tanıma desteklenmiyor."
-                            : "Türkçe çevrimdışı konuşma modeli hazır değil. Sistem dil paketini indirin.")
+                            : "Cihazda çevrimdışı konuşma tanıma servisi bulunamadı.")
                         : "Konuşma tanıma servisi cihazda bulunamadı.";
                 sendImmediateError(sessionId, requested.name(), unityGameObject, unityCallbackMethod,
                         SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE, error);
@@ -382,8 +392,13 @@ public final class AndroidSpeechRecognizerBridge {
     }
 
     private static void beginAttempt(Activity activity, Session session, Mode used) {
+        if (activity == null) {
+            failSession(session, SpeechRecognizer.ERROR_CLIENT, "Unity activity hazır değil.", false);
+            return;
+        }
         session.used = used;
         session.attempt++;
+        int generation = ++session.activeRecognizerGeneration;
         session.listeningStartedAt = System.currentTimeMillis();
         session.service = recognizerService(activity, used);
         state = State.STARTING;
@@ -392,14 +407,17 @@ public final class AndroidSpeechRecognizerBridge {
                     ? SpeechRecognizer.createOnDeviceSpeechRecognizer(activity)
                     : SpeechRecognizer.createSpeechRecognizer(activity);
             session.recognizer = recognizer;
-            int attempt = session.attempt;
-            recognizer.setRecognitionListener(new Listener(session, attempt));
+            recognizer.setRecognitionListener(new Listener(session, generation));
             boolean biasing = used == Mode.OFFLINE ? offlineBiasingSupported : onlineBiasingSupported;
             boolean formatting = used == Mode.OFFLINE ? offlineFormattingSupported : onlineFormattingSupported;
             Intent intent = recognitionIntent(used, biasing, formatting);
             Log.i(TAG, String.format(Locale.US,
-                    "[AndroidSTT] session_id=%s requested_mode=%s used_mode=%s service=%s language=%s partial_results=true biasing_enabled=%s max_results=%d",
-                    session.id, session.requested, used, session.service, LANGUAGE, biasing, MAX_RESULTS));
+                    "[AndroidSTT] session_id=%s requested_mode=%s used_mode=%s retry_reason=%s "
+                            + "on_device_available=%s retry_count=%d recognizer_recreated=%s language=%s "
+                            + "callback=startListening service=%s partial_results=true biasing_enabled=%s max_results=%d",
+                    session.id, session.requested, usedModeLogName(used), session.retryReason,
+                    onDeviceServiceAvailable, session.retriedOnDevice ? 1 : 0, session.attempt > 1,
+                    LANGUAGE, session.service, biasing, MAX_RESULTS));
             sendEvent(session, "STATE", null, 0, "", State.STARTING);
             recognizer.startListening(intent);
         } catch (Throwable t) {
@@ -436,9 +454,11 @@ public final class AndroidSpeechRecognizerBridge {
                 Session session = activeSession;
                 if (!matches(session, sessionId)) return;
                 state = State.CANCELLED;
+                session.terminalDelivered = true;
+                session.activeRecognizerGeneration++;
                 try { if (session.recognizer != null) session.recognizer.cancel(); } catch (Throwable ignored) {}
                 sendEvent(session, "STATE", null, 0, "", state);
-                destroyRecognizer(session);
+                releaseRecognizer(session, false);
                 activeSession = null;
                 state = State.IDLE;
             }
@@ -452,10 +472,11 @@ public final class AndroidSpeechRecognizerBridge {
             synchronized (LOCK) {
                 Session session = activeSession;
                 if (session != null) {
-                    try { if (session.recognizer != null) session.recognizer.cancel(); } catch (Throwable ignored) {}
                     state = State.DESTROYED;
+                    session.terminalDelivered = true;
+                    session.activeRecognizerGeneration++;
                     sendEvent(session, "STATE", null, 0, "", state);
-                    destroyRecognizer(session);
+                    releaseRecognizer(session, true);
                 }
                 activeSession = null;
                 state = State.DESTROYED;
@@ -463,18 +484,52 @@ public final class AndroidSpeechRecognizerBridge {
         });
     }
 
+    private static void scheduleOnDeviceRetry(Activity activity, Session session, int error) {
+        final SpeechRecognizer disconnected;
+        synchronized (LOCK) {
+            if (activeSession != session || session.terminalDelivered || session.retryStarted) return;
+            session.retryStarted = true;
+            session.retriedOnDevice = true;
+            session.retryReason = errorName(error);
+            // Invalidate the old callback generation immediately. Destruction and recreation are
+            // deferred to the next main-loop turn so they never occur in the provider callback.
+            session.activeRecognizerGeneration++;
+            disconnected = session.recognizer;
+            session.recognizer = null;
+            state = State.STARTING;
+        }
+        mainHandler().post(() -> {
+            if (disconnected != null) {
+                try { disconnected.setRecognitionListener(null); } catch (Throwable ignored) {}
+                // ERROR_SERVER_DISCONNECTED recognizers must not be cancelled before teardown.
+                try { disconnected.destroy(); } catch (Throwable t) {
+                    Log.w(TAG, "Disconnected recognizer destroy failed", t);
+                }
+            }
+            synchronized (LOCK) {
+                if (activeSession != session || session.terminalDelivered) return;
+                beginAttempt(activity, session, Mode.OFFLINE);
+            }
+        });
+    }
+
     private static final class Listener implements RecognitionListener {
         private final Session session;
-        private final int attempt;
-        Listener(Session session, int attempt) { this.session = session; this.attempt = attempt; }
+        private final int generation;
+        Listener(Session session, int generation) { this.session = session; this.generation = generation; }
 
         private boolean current() {
-            synchronized (LOCK) { return activeSession == session && session.attempt == attempt && !isTerminal(state); }
+            synchronized (LOCK) {
+                return activeSession == session
+                        && session.activeRecognizerGeneration == generation
+                        && !session.terminalDelivered && !isTerminal(state);
+            }
         }
         @Override public void onReadyForSpeech(Bundle params) {
             if (!current()) return;
             markActualRecognitionUsable(session.used);
             state = State.LISTENING;
+            logLifecycleCallback(session, "onReadyForSpeech");
             sendEvent(session, "STATE", null, 0, "", state);
         }
         @Override public void onBeginningOfSpeech() {
@@ -492,31 +547,46 @@ public final class AndroidSpeechRecognizerBridge {
         @Override public void onError(int error) {
             if (!current()) return;
             updateSupportFromActualError(session.used, error);
-            if (session.used == Mode.OFFLINE && error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
-                requestOfflineModelDownload(unityActivity(), true, "ACTUAL_ERROR_LANGUAGE_UNAVAILABLE");
+            NetworkDiagnostics diagnostics = networkDiagnostics(unityActivity());
+            if (isNetworkError(error)) session.networkErrorSeen = true;
+            if ("UNAVAILABLE".equals(diagnostics.state) || "false".equals(diagnostics.validated)) {
+                session.networkKnownUnavailable = true;
             }
+            Activity activity = unityActivity();
+            boolean onDeviceAvailable = refreshOnDeviceAvailability(activity);
             boolean retry = shouldRetryOnDeviceForTesting(session.requested.name(), session.used.name(),
-                    session.retriedOnDevice, offlineUsable, error);
+                    session.retriedOnDevice, onDeviceAvailable,
+                    session.networkErrorSeen || session.networkKnownUnavailable, error);
+            String loggedRetryReason = retry || (session.used == Mode.ONLINE && isNetworkError(error))
+                    ? errorName(error) : session.retryReason;
             Log.e(TAG, String.format(Locale.US,
-                    "[AndroidSTTError] session_id=%s mode=%s error_code=%d error_name=%s android_on_device_retry=%s",
-                    session.id, session.used, error, errorName(error), retry));
+                    "[AndroidSTT] session_id=%s requested_mode=%s used_mode=%s retry_reason=%s "
+                            + "on_device_available=%s retry_count=%d recognizer_recreated=%s language=%s "
+                            + "error_code=%d error_name=%s android_on_device_retry=%s",
+                    session.id, session.requested, usedModeLogName(session.used), loggedRetryReason,
+                    onDeviceAvailable, session.retriedOnDevice ? 1 : 0, session.attempt > 1,
+                    LANGUAGE, error, errorName(error), retry));
             if (retry) {
-                session.retriedOnDevice = true;
-                destroyRecognizer(session);
-                beginAttempt(unityActivity(), session, Mode.OFFLINE);
+                scheduleOnDeviceRetry(activity, session, error);
                 return;
             }
-            failSession(session, error, userError(error), false);
+            if (session.used == Mode.OFFLINE && error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+                offlineModelStatus = "DOWNLOAD_REQUIRED";
+                persistModelState(activity, offlineModelStatus);
+                logModelStatus(activity, errorName(error), false, false, false, true);
+            }
+            failSession(session, error, sessionError(session, error, onDeviceAvailable), false);
         }
         @Override public void onResults(Bundle results) {
             if (!current() || session.finalSent) return;
             markActualRecognitionUsable(session.used);
             session.finalSent = true;
+            session.terminalDelivered = true;
             session.finalResultAt = System.currentTimeMillis();
             state = State.COMPLETED;
+            logLifecycleCallback(session, "onResults");
             sendEvent(session, "FINAL", results, 0, "", state);
-            destroyRecognizer(session);
-            synchronized (LOCK) { if (activeSession == session) activeSession = null; }
+            resetTerminalSession(session);
         }
         @Override public void onPartialResults(Bundle partialResults) {
             if (!current() || session.finalSent) return;
@@ -531,6 +601,7 @@ public final class AndroidSpeechRecognizerBridge {
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, LANGUAGE);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, LANGUAGE);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, MAX_RESULTS);
         intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, mode == Mode.OFFLINE);
@@ -609,32 +680,59 @@ public final class AndroidSpeechRecognizerBridge {
     private static Mode chooseMode(Context context, Mode requested) {
         NetworkDiagnostics network = networkDiagnostics(context);
         String selected = selectModeNameForTesting(
-                requested.name(), network.validatedInternet, onlineUsable,
+                requested.name(), network.state, network.validated, onlineUsable,
                 Build.VERSION.SDK_INT, onDeviceServiceAvailable, offlineUsable);
-        return selected.isEmpty() ? null : Mode.valueOf(selected);
+        if (selected.isEmpty()) return null;
+        return "ON_DEVICE".equals(selected) ? Mode.OFFLINE : Mode.valueOf(selected);
     }
 
     static String selectModeNameForTesting(String requestedValue, boolean validatedInternet,
                                            boolean standardAvailable, int apiLevel,
                                            boolean onDeviceAvailable, boolean offlineReadyOrUsable) {
+        return selectModeNameForTesting(requestedValue, "AVAILABLE",
+                Boolean.toString(validatedInternet), standardAvailable, apiLevel,
+                onDeviceAvailable, offlineReadyOrUsable);
+    }
+
+    static String selectModeNameForTesting(String requestedValue, String networkStateValue,
+                                           String networkValidatedValue, boolean standardAvailable,
+                                           int apiLevel, boolean onDeviceAvailable,
+                                           boolean offlineReadyOrUsable) {
         Mode requested = parseMode(requestedValue);
         if (requested == Mode.ONLINE) return standardAvailable ? Mode.ONLINE.name() : "";
-        boolean canUseOffline = apiLevel >= 31 && onDeviceAvailable && offlineReadyOrUsable;
-        if (requested == Mode.OFFLINE) return canUseOffline ? Mode.OFFLINE.name() : "";
-        // ConnectivityManager is advisory: OEM/network callbacks can transiently report
-        // false/unknown even though the configured recognition service is usable.
+        // RecognitionSupport language lists are advisory. Service availability plus the
+        // real startListening callbacks are authoritative for an on-device attempt.
+        boolean canUseOffline = apiLevel >= 31 && onDeviceAvailable;
+        if (requested == Mode.OFFLINE) return canUseOffline ? "ON_DEVICE" : "";
+        boolean networkKnownUnavailable = "UNAVAILABLE".equalsIgnoreCase(networkStateValue)
+                || "false".equalsIgnoreCase(networkValidatedValue);
+        if (networkKnownUnavailable && canUseOffline) return "ON_DEVICE";
         if (standardAvailable) return Mode.ONLINE.name();
-        return canUseOffline ? Mode.OFFLINE.name() : "";
+        return canUseOffline ? "ON_DEVICE" : "";
     }
 
     static String selectionReasonForTesting(String requestedValue, boolean standardAvailable,
                                             int apiLevel, boolean onDeviceAvailable,
                                             boolean offlineReadyOrUsable) {
+        return selectionReasonForTesting(requestedValue, "UNKNOWN", "unknown", standardAvailable,
+                apiLevel, onDeviceAvailable, offlineReadyOrUsable);
+    }
+
+    static String selectionReasonForTesting(String requestedValue, String networkStateValue,
+                                            String networkValidatedValue, boolean standardAvailable,
+                                            int apiLevel, boolean onDeviceAvailable,
+                                            boolean offlineReadyOrUsable) {
         Mode requested = parseMode(requestedValue);
+        boolean canUseOffline = apiLevel >= 31 && onDeviceAvailable;
+        boolean networkKnownUnavailable = "UNAVAILABLE".equalsIgnoreCase(networkStateValue)
+                || "false".equalsIgnoreCase(networkValidatedValue);
+        if (requested == Mode.AUTO && networkKnownUnavailable && canUseOffline) {
+            return "NETWORK_UNAVAILABLE_ON_DEVICE_AVAILABLE";
+        }
         if ((requested == Mode.AUTO || requested == Mode.ONLINE) && standardAvailable) {
             return "STANDARD_SERVICE_AVAILABLE";
         }
-        if (apiLevel >= 31 && onDeviceAvailable && offlineReadyOrUsable) {
+        if (canUseOffline) {
             return requested == Mode.OFFLINE ? "OFFLINE_REQUESTED_AND_AVAILABLE" : "ON_DEVICE_AVAILABLE";
         }
         return "NO_RECOGNIZER_AVAILABLE";
@@ -642,12 +740,28 @@ public final class AndroidSpeechRecognizerBridge {
 
     static boolean shouldRetryOnDeviceForTesting(String requestedValue, String usedValue,
                                                   boolean alreadyRetried, boolean turkishReady, int error) {
+        return shouldRetryOnDeviceForTesting(requestedValue, usedValue, alreadyRetried,
+                turkishReady, isNetworkError(error), error);
+    }
+
+    static boolean shouldRetryOnDeviceForTesting(String requestedValue, String usedValue,
+                                                  boolean alreadyRetried, boolean onDeviceAvailable,
+                                                  boolean networkErrorSeen, int error) {
         return parseMode(requestedValue) == Mode.AUTO && parseMode(usedValue) == Mode.ONLINE
-                && !alreadyRetried && turkishReady && isOnlineFailure(error);
+                && !alreadyRetried && onDeviceAvailable
+                && (isNetworkError(error)
+                    || (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
+                        && networkErrorSeen));
     }
 
     static String userErrorForTesting(int error) {
         return userErrorAtApi(error, 35);
+    }
+
+    static String sessionErrorForTesting(String usedValue, int error, boolean onDeviceAvailable) {
+        Mode used = parseMode(usedValue);
+        Session session = new Session("test", used, used, "", "");
+        return sessionError(session, error, onDeviceAvailable);
     }
 
     static boolean onlineUsableAfterSupportErrorForTesting(boolean standardAvailable, int error) {
@@ -711,6 +825,11 @@ public final class AndroidSpeechRecognizerBridge {
             onDeviceSupportStatus = SupportStatus.SUPPORTED;
             trTurkishOnDeviceReady = true;
             offlineUsable = true;
+            Activity activity = unityActivity();
+            if (activity != null) {
+                offlineModelStatus = "INSTALLED";
+                persistModelState(activity, offlineModelStatus);
+            }
         } else {
             changed = onlineSupportStatus != SupportStatus.SUPPORTED || !onlineUsable;
             onlineSupportStatus = SupportStatus.SUPPORTED;
@@ -722,159 +841,385 @@ public final class AndroidSpeechRecognizerBridge {
     private static void updateSupportFromActualError(Mode mode, int error) {
         if (!isLanguageError(error)) return;
         SupportStatus status = supportStatusForError(error);
-        if (mode == Mode.OFFLINE) {
-            onDeviceSupportStatus = status;
-            trTurkishOnDeviceReady = false;
-            offlineUsable = false;
-        } else {
-            onlineSupportStatus = status;
-            onlineUsable = false;
-        }
-        Log.w(TAG, "Actual recognition language error mode=" + mode + " status=" + status
-                + " error=" + errorName(error));
+        // A language error belongs only to this recognizer attempt. It must not latch the
+        // process into a global "service unavailable" state or block the next request.
+        Log.w(TAG, "Actual recognition language error is session-scoped mode=" + mode
+                + " status=" + status + " error=" + errorName(error));
     }
 
-    private static void requestOfflineModelDownload(Activity activity, boolean force, String reason) {
-        if (activity == null || trTurkishOnDeviceReady) return;
-        if (Build.VERSION.SDK_INT < 33) {
-            offlineModelStatus = "UNSUPPORTED_API";
+    /** Debug-only escape hatch used by the physical-device model provisioning workflow. */
+    public static void forceRequestTurkishOnDeviceModel() {
+        final Activity activity = unityActivity();
+        if (activity == null) return;
+        boolean debuggable = (activity.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        if (!debuggable) {
+            Log.w(TAG, "[AndroidSTTModel] force_request_rejected=release_build language=" + LANGUAGE);
             return;
         }
-        SharedPreferences prefs = activity.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE);
-        long now = System.currentTimeMillis();
-        String lastResult = prefs.getString(PREF_LAST_RESULT, "NONE");
-        long requestedAt = prefs.getLong(PREF_REQUESTED_AT, 0L);
-        boolean forcedRetry = force && !forcedModelDownloadRetryUsed;
-        if (!shouldStartModelDownloadForTesting(Build.VERSION.SDK_INT, false, modelDownloadRequested,
-                lastResult, requestedAt, now, forcedRetry)) {
-            offlineModelStatus = lastResult == null ? "UNKNOWN" : lastResult;
-            Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                    + " api_level=" + Build.VERSION.SDK_INT
-                    + " request_started=false request_method=" + downloadMethodForTesting(Build.VERSION.SDK_INT)
-                    + " blocking=false skip_reason=RETRY_POLICY last_result=" + offlineModelStatus);
-            return;
+        refreshOnDeviceAvailability(activity);
+        beginTurkishOnDeviceModelRequest(activity, true);
+    }
+
+    public static String requestTurkishOnDeviceModel(String unityGameObject, String unityCallbackMethod) {
+        final Activity activity = unityActivity();
+        if (activity == null) {
+            return modelActionJson(false, "UNKNOWN", false, "Unity activity hazır değil.");
         }
-        if (forcedRetry) forcedModelDownloadRetryUsed = true;
-        modelDownloadRequested = true;
-        offlineModelStatus = "REQUESTED";
-        persistModelResult(activity, "REQUESTED", 0, true);
-        activity.runOnUiThread(() -> {
-            SpeechRecognizer recognizer = null;
-            try {
-                recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(activity);
-                Intent intent = recognitionIntent(Mode.OFFLINE, false, false);
-                String method = downloadMethodForTesting(Build.VERSION.SDK_INT);
-                Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                        + " api_level=" + Build.VERSION.SDK_INT
-                        + " request_started=true request_method=" + method
-                        + " blocking=false reason=" + reason);
-                if (Build.VERSION.SDK_INT >= 34) {
-                    Api34ModelDownload.trigger(activity, recognizer, intent);
-                } else {
-                    recognizer.triggerModelDownload(intent);
-                    persistModelResult(activity, "REQUESTED", 0, false);
-                    scheduleOfflineSupportRecheck(activity, MODEL_RECHECK_DELAY_MS);
-                    recognizer.destroy();
-                }
-            } catch (Throwable t) {
-                if (recognizer != null) {
-                    try { recognizer.destroy(); } catch (Throwable ignored) {}
-                }
-                offlineModelStatus = "FAILED";
-                persistModelResult(activity, "FAILED", SpeechRecognizer.ERROR_CLIENT, false);
-                Log.e(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                        + " download_status=ERROR error_code=" + SpeechRecognizer.ERROR_CLIENT, t);
+        setModelUnityCallback(unityGameObject, unityCallbackMethod);
+        refreshOnDeviceAvailability(activity);
+        String current = readModelState(activity);
+        NetworkDiagnostics network = networkDiagnostics(activity);
+        if ("INSTALLED".equals(current) || trTurkishOnDeviceReady) {
+            offlineModelStatus = "INSTALLED";
+            persistModelState(activity, offlineModelStatus);
+            sendModelEvent(activity, "installed", true, false, "");
+            return modelActionJson(true, offlineModelStatus, network.validatedInternet, "");
+        }
+        synchronized (LOCK) {
+            if (modelDownloadInFlight || "REQUESTED".equals(current) || "PENDING".equals(current)) {
+                modelDownloadInFlight = true;
+                scheduleModelPoll(activity);
+                return modelActionJson(true, current, network.validatedInternet, "");
             }
-        });
+        }
+        if (!network.validatedInternet) {
+            return modelActionJson(false, current, false,
+                    "Modeli indirmek için Wi-Fi veya mobil veriyi açın.");
+        }
+        beginTurkishOnDeviceModelRequest(activity, true);
+        return modelActionJson(true, "REQUESTED", true, "");
     }
 
-    static boolean shouldStartModelDownloadForTesting(int apiLevel, boolean ready,
-                                                      boolean requestedThisProcess, String lastResult,
-                                                      long requestedAt, long now, boolean forcedRetry) {
-        if (apiLevel < 33 || ready) return false;
-        if (forcedRetry) return true;
-        if (requestedThisProcess) return false;
-        if (requestedAt <= 0L) return true;
-        long elapsed = Math.max(0L, now - requestedAt);
-        long retryAfter = "FAILED".equals(lastResult) ? MODEL_FAILURE_RETRY_MS : MODEL_REQUEST_RETRY_MS;
-        return elapsed >= retryAfter;
+    public static String observeTurkishOnDeviceModel(String unityGameObject, String unityCallbackMethod) {
+        final Activity activity = unityActivity();
+        if (activity == null) return modelActionJson(false, "UNKNOWN", false, "Unity activity hazır değil.");
+        setModelUnityCallback(unityGameObject, unityCallbackMethod);
+        String current = readModelState(activity);
+        if ("INSTALLED".equals(current) || trTurkishOnDeviceReady) {
+            sendModelEvent(activity, "installed", true, false, "");
+        } else if ("REQUESTED".equals(current) || "PENDING".equals(current)) {
+            synchronized (LOCK) { modelDownloadInFlight = true; }
+            scheduleModelPoll(activity);
+        }
+        return modelActionJson(true, current, networkDiagnostics(activity).validatedInternet, "");
     }
 
-    static String downloadMethodForTesting(int apiLevel) {
-        if (apiLevel >= 34) return "LISTENER_TRIGGER";
-        if (apiLevel >= 33) return "LEGACY_TRIGGER";
-        return "UNSUPPORTED";
+    private static void setModelUnityCallback(String target, String callback) {
+        synchronized (LOCK) {
+            modelUnityGameObject = target == null ? "" : target;
+            modelUnityCallbackMethod = callback == null ? "" : callback;
+        }
     }
 
-    static boolean shouldRecheckAfterDownloadStatusForTesting(String status) {
-        return "SUCCESS".equals(status) || "REQUESTED".equals(status) || "SCHEDULED".equals(status);
+    private static void beginTurkishOnDeviceModelRequest(Activity activity, boolean userInitiated) {
+        if (activity == null || Build.VERSION.SDK_INT < 33 || !onDeviceServiceAvailable) {
+            finishModelDownload(activity, false, "ON_DEVICE_SERVICE_UNAVAILABLE");
+            return;
+        }
+        String current = readModelState(activity);
+        if ("INSTALLED".equals(current) || trTurkishOnDeviceReady) {
+            finishModelDownload(activity, true, "");
+            return;
+        }
+        synchronized (LOCK) {
+            if (modelDownloadInFlight || "REQUESTED".equals(current) || "PENDING".equals(current)) {
+                modelDownloadInFlight = true;
+                scheduleModelPoll(activity);
+                return;
+            }
+        }
+        NetworkDiagnostics network = networkDiagnostics(activity);
+        if (!network.validatedInternet) return;
+        SharedPreferences prefs = activity.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE);
+        String prefix = modelPreferencePrefix(activity);
+        long lastRequested = prefs.getLong(prefix + ".requested_at", 0L);
+        if (!userInitiated && System.currentTimeMillis() - lastRequested < MODEL_DOWNLOAD_COOLDOWN_MS) {
+            scheduleModelPoll(activity);
+            return;
+        }
+        synchronized (LOCK) {
+            modelDownloadInFlight = true;
+            modelDownloadStartedAt = System.currentTimeMillis();
+            modelPollCount = 0;
+        }
+        mainHandler().post(() -> requestModelDownloadOnMain(activity));
     }
 
-    private static String readModelResult(Context context) {
-        if (context == null) return "UNKNOWN";
-        return context.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE)
-                .getString(PREF_LAST_RESULT, "UNKNOWN");
-    }
-
-    private static void persistModelResult(Context context, String result, int error, boolean updateRequestedAt) {
-        if (context == null) return;
-        SharedPreferences.Editor editor = context.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE)
-                .edit()
-                .putString(PREF_LAST_RESULT, result)
-                .putInt(PREF_LAST_ERROR, error)
-                .putString(PREF_LANGUAGE_TAG, LANGUAGE);
-        if (updateRequestedAt) editor.putLong(PREF_REQUESTED_AT, System.currentTimeMillis());
-        editor.apply();
-        offlineModelStatus = result;
-    }
-
-    private static void scheduleOfflineSupportRecheck(Activity activity, long delayMs) {
-        new Handler(Looper.getMainLooper()).postDelayed(() -> recheckOfflineSupport(activity), delayMs);
-    }
-
-    private static void recheckOfflineSupport(Activity activity) {
-        if (activity == null || Build.VERSION.SDK_INT < 33
-                || !SpeechRecognizer.isOnDeviceRecognitionAvailable(activity)) return;
-        SpeechRecognizer recognizer = null;
+    private static void requestModelDownloadOnMain(Activity activity) {
+        NetworkDiagnostics network = networkDiagnostics(activity);
+        if (!network.validatedInternet || Build.VERSION.SDK_INT < 33) {
+            finishModelDownload(activity, false, "NETWORK_NOT_VALIDATED");
+            return;
+        }
+        final SpeechRecognizer recognizer;
         try {
             recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(activity);
-            final SpeechRecognizer checkedRecognizer = recognizer;
+            recognizer.setRecognitionListener(new ModelRecognitionListener());
+        } catch (Throwable t) {
+            Log.w(TAG, "[AndroidSTTModel] on-device recognizer creation failed", t);
+            finishModelDownload(activity, false, "RECOGNIZER_CREATE_FAILED");
+            return;
+        }
+        Intent intent = recognitionIntent(Mode.OFFLINE, false, false);
+        try {
+            recognizer.checkRecognitionSupport(intent, activity.getMainExecutor(),
+                    new RecognitionSupportCallback() {
+                @Override public void onSupportResult(RecognitionSupport support) {
+                    boolean installed = containsLanguage(support.getInstalledOnDeviceLanguages(), LANGUAGE);
+                    boolean pending = containsLanguage(support.getPendingOnDeviceLanguages(), LANGUAGE);
+                    boolean supported = containsLanguage(support.getSupportedOnDeviceLanguages(), LANGUAGE);
+                    logModelStatus(activity, "DOWNLOAD_SUPPORT", installed, pending, supported,
+                            !installed && supported);
+                    if (installed) {
+                        offlineModelStatus = "INSTALLED";
+                        trTurkishOnDeviceReady = true;
+                        offlineUsable = true;
+                        persistModelState(activity, offlineModelStatus);
+                        destroyTemporaryRecognizer(recognizer);
+                        finishModelDownload(activity, true, "");
+                    } else if (pending) {
+                        offlineModelStatus = "PENDING";
+                        persistModelState(activity, offlineModelStatus);
+                        destroyTemporaryRecognizer(recognizer);
+                        scheduleModelPoll(activity);
+                    } else {
+                        triggerModelDownload(activity, recognizer, intent);
+                    }
+                }
+
+                @Override public void onError(int error) {
+                    logModelStatus(activity, errorName(error), false, false, false, true);
+                    // Samsung/AiAi may not expose authoritative support lists. The actual
+                    // API-33 download request remains valid and is verified by later polling.
+                    triggerModelDownload(activity, recognizer, intent);
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "[AndroidSTTModel] support query failed; requesting model", t);
+            triggerModelDownload(activity, recognizer, intent);
+        }
+    }
+
+    private static void triggerModelDownload(Activity activity, SpeechRecognizer recognizer, Intent intent) {
+        NetworkDiagnostics network = networkDiagnostics(activity);
+        if (!network.validatedInternet) {
+            destroyTemporaryRecognizer(recognizer);
+            finishModelDownload(activity, false, "NETWORK_NOT_VALIDATED");
+            return;
+        }
+        try {
+            recognizer.triggerModelDownload(intent);
+            synchronized (LOCK) { modelDownloadRecognizer = recognizer; }
+            modelDownloadRequested = true;
+            offlineModelStatus = "REQUESTED";
+            SharedPreferences prefs = activity.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE);
+            String prefix = modelPreferencePrefix(activity);
+            prefs.edit().putString(prefix + ".state", offlineModelStatus)
+                    .putLong(prefix + ".requested_at", System.currentTimeMillis()).apply();
+            Log.i(TAG, "[AndroidSTTModel] event=download_requested language=" + LANGUAGE
+                    + " provider=" + onDeviceProvider(activity) + " api=" + Build.VERSION.SDK_INT);
+            scheduleModelPoll(activity);
+        } catch (Throwable t) {
+            offlineModelStatus = "FAILED";
+            persistModelState(activity, offlineModelStatus);
+            Log.w(TAG, "[AndroidSTTModel] triggerModelDownload failed", t);
+            destroyTemporaryRecognizer(recognizer);
+            finishModelDownload(activity, false, "TRIGGER_FAILED");
+        }
+    }
+
+    private static void scheduleModelPoll(Activity activity) {
+        synchronized (LOCK) {
+            if (Build.VERSION.SDK_INT < 33 || modelPollScheduled) return;
+            if (modelPollCount >= MODEL_POLL_LIMIT) {
+                finishModelDownload(activity, false, "TIMEOUT");
+                return;
+            }
+            modelPollScheduled = true;
+        }
+        mainHandler().postDelayed(() -> pollModelSupport(activity), MODEL_POLL_INTERVAL_MS);
+    }
+
+    private static void pollModelSupport(Activity activity) {
+        synchronized (LOCK) { modelPollScheduled = false; }
+        if (Build.VERSION.SDK_INT < 33 || modelPollCount++ >= MODEL_POLL_LIMIT) return;
+        final SpeechRecognizer recognizer;
+        try {
+            recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(activity);
+            recognizer.setRecognitionListener(new ModelRecognitionListener());
             recognizer.checkRecognitionSupport(recognitionIntent(Mode.OFFLINE, false, false),
                     activity.getMainExecutor(), new RecognitionSupportCallback() {
                 @Override public void onSupportResult(RecognitionSupport support) {
                     boolean installed = containsLanguage(support.getInstalledOnDeviceLanguages(), LANGUAGE);
+                    boolean pending = containsLanguage(support.getPendingOnDeviceLanguages(), LANGUAGE);
+                    boolean supported = containsLanguage(support.getSupportedOnDeviceLanguages(), LANGUAGE);
+                    long elapsed = modelDownloadStartedAt > 0L
+                            ? System.currentTimeMillis() - modelDownloadStartedAt : 0L;
+                    Log.i(TAG, "[AndroidSTTModel] event=status_poll installed=" + installed
+                            + " pending=" + pending + " supported=" + supported
+                            + " elapsed_ms=" + elapsed);
                     if (installed) {
+                        offlineModelStatus = "INSTALLED";
                         trTurkishOnDeviceReady = true;
                         offlineUsable = true;
-                        onDeviceSupportStatus = SupportStatus.SUPPORTED;
-                        persistModelResult(activity, "INSTALLED", 0, false);
-                        Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                                + " download_status=INSTALLED offline_usable=true");
+                        persistModelState(activity, offlineModelStatus);
                     } else {
-                        persistModelResult(activity, "PENDING", 0, false);
-                        Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                                + " download_status=PENDING offline_usable=" + offlineUsable);
+                        offlineModelStatus = pending ? "PENDING" : "REQUESTED";
+                        persistModelState(activity, offlineModelStatus);
                     }
-                    checkedRecognizer.destroy();
+                    logModelStatus(activity, "POLL_" + modelPollCount, installed, pending,
+                            supported, !installed && supported);
+                    destroyTemporaryRecognizer(recognizer);
+                    sendModelEvent(activity, "status_poll", installed, pending, "");
+                    if (installed) finishModelDownload(activity, true, "");
+                    else scheduleModelPoll(activity);
                 }
 
                 @Override public void onError(int error) {
-                    if (isLanguageError(error)) updateSupportFromActualError(Mode.OFFLINE, error);
-                    persistModelResult(activity, isCannotCheckSupport(error) ? "CHECK_UNAVAILABLE" : "PENDING",
-                            error, false);
-                    Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                            + " download_status=" + offlineModelStatus + " error_code=" + error);
-                    checkedRecognizer.destroy();
+                    logModelStatus(activity, "POLL_" + errorName(error), false, false, false, false);
+                    destroyTemporaryRecognizer(recognizer);
+                    scheduleModelPoll(activity);
                 }
             });
         } catch (Throwable t) {
-            if (recognizer != null) {
-                try { recognizer.destroy(); } catch (Throwable ignored) {}
-            }
-            persistModelResult(activity, "FAILED", SpeechRecognizer.ERROR_CLIENT, false);
-            Log.w(TAG, "Offline model support recheck failed", t);
+            Log.w(TAG, "[AndroidSTTModel] poll failed", t);
+            scheduleModelPoll(activity);
         }
     }
+
+    private static void finishModelDownload(Activity activity, boolean installed, String reason) {
+        SpeechRecognizer retained;
+        long duration;
+        synchronized (LOCK) {
+            retained = modelDownloadRecognizer;
+            modelDownloadRecognizer = null;
+            modelDownloadInFlight = false;
+            modelPollScheduled = false;
+            duration = modelDownloadStartedAt > 0L
+                    ? System.currentTimeMillis() - modelDownloadStartedAt : 0L;
+            modelDownloadStartedAt = 0L;
+        }
+        destroyTemporaryRecognizer(retained);
+        if (installed) {
+            offlineModelStatus = "INSTALLED";
+            trTurkishOnDeviceReady = true;
+            offlineUsable = true;
+            if (activity != null) persistModelState(activity, offlineModelStatus);
+            Log.i(TAG, "[AndroidSTTModel] event=installed language=" + LANGUAGE
+                    + " provider=" + (activity == null ? "" : onDeviceProvider(activity))
+                    + " duration_ms=" + duration);
+            sendModelEvent(activity, "installed", true, false, "");
+        } else {
+            offlineModelStatus = "FAILED";
+            if (activity != null) persistModelState(activity, offlineModelStatus);
+            Log.w(TAG, "[AndroidSTTModel] event=download_failed reason=" + reason);
+            sendModelEvent(activity, "download_failed", false, false, reason);
+        }
+    }
+
+    private static void sendModelEvent(Context context, String event, boolean installed,
+                                       boolean pending, String reason) {
+        String target;
+        String callback;
+        synchronized (LOCK) {
+            target = modelUnityGameObject;
+            callback = modelUnityCallbackMethod;
+        }
+        if (target.isEmpty() || callback.isEmpty()) return;
+        try {
+            JSONObject json = new JSONObject();
+            json.put("event_name", event);
+            json.put("provider", context == null ? "" : onDeviceProvider(context));
+            json.put("model_status", offlineModelStatus);
+            json.put("installed", installed);
+            json.put("pending", pending);
+            json.put("reason", reason == null ? "" : reason);
+            unityMessage(target, callback, json.toString());
+        } catch (Throwable t) {
+            Log.w(TAG, "Model event JSON failed", t);
+        }
+    }
+
+    private static String modelActionJson(boolean ok, String status, boolean network, String error) {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("ok", ok);
+            json.put("model_status", status == null ? "UNKNOWN" : status);
+            json.put("network_validated", network);
+            json.put("error", error == null ? "" : error);
+            Activity activity = unityActivity();
+            json.put("provider", activity == null ? "" : onDeviceProvider(activity));
+            return json.toString();
+        } catch (Throwable ignored) {
+            return "{\"ok\":false,\"model_status\":\"UNKNOWN\"}";
+        }
+    }
+
+    private static void destroyTemporaryRecognizer(SpeechRecognizer recognizer) {
+        if (recognizer == null) return;
+        try { recognizer.setRecognitionListener(null); } catch (Throwable ignored) {}
+        try { recognizer.destroy(); } catch (Throwable ignored) {}
+    }
+
+    private static String readModelState(Context context) {
+        if (context == null) return "UNKNOWN";
+        return context.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE)
+                .getString(modelPreferencePrefix(context) + ".state", "NOT_REQUESTED");
+    }
+
+    private static void persistModelState(Context context, String value) {
+        if (context == null) return;
+        context.getSharedPreferences(MODEL_PREFS, Context.MODE_PRIVATE).edit()
+                .putString(modelPreferencePrefix(context) + ".state", value).apply();
+    }
+
+    private static String modelPreferencePrefix(Context context) {
+        long version = 0L;
+        try {
+            version = Build.VERSION.SDK_INT >= 28
+                    ? context.getPackageManager().getPackageInfo(context.getPackageName(), 0).getLongVersionCode()
+                    : context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionCode;
+        } catch (Throwable ignored) {}
+        return (onDeviceProvider(context) + "|" + LANGUAGE + "|" + version).replaceAll("[^A-Za-z0-9_.|-]", "_");
+    }
+
+    private static String onDeviceProvider(Context context) {
+        String service = recognizerService(context, Mode.OFFLINE);
+        int slash = service.indexOf('/');
+        return slash > 0 ? service.substring(0, slash) : service;
+    }
+
+    private static void logModelStatus(Context context, String status, boolean installed,
+                                       boolean pending, boolean supported, boolean downloadRequired) {
+        NetworkDiagnostics network = networkDiagnostics(context);
+        Log.i(TAG, "[AndroidSTTModel] language=" + LANGUAGE
+                + " provider=" + onDeviceProvider(context)
+                + " api=" + Build.VERSION.SDK_INT
+                + " support_status=" + status
+                + " installed=" + installed
+                + " pending=" + pending
+                + " supported=" + supported
+                + " download_required=" + downloadRequired
+                + " download_requested=" + modelDownloadRequested
+                + " network_validated=" + network.validated);
+    }
+
+    private static final class ModelRecognitionListener implements RecognitionListener {
+        @Override public void onReadyForSpeech(Bundle params) {}
+        @Override public void onBeginningOfSpeech() {}
+        @Override public void onRmsChanged(float rmsdB) {}
+        @Override public void onBufferReceived(byte[] buffer) {}
+        @Override public void onEndOfSpeech() {}
+        @Override public void onError(int error) {}
+        @Override public void onResults(Bundle results) {}
+        @Override public void onPartialResults(Bundle partialResults) {}
+        @Override public void onEvent(int eventType, Bundle params) {}
+    }
+
+    private static Handler mainHandler() {
+        return new Handler(Looper.getMainLooper());
+    }
+
 
     private static NetworkDiagnostics networkDiagnostics(Context context) {
         try {
@@ -903,41 +1248,6 @@ public final class AndroidSpeechRecognizerBridge {
         }
     }
 
-    /** Isolates API 34-only listener types from class verification on Android 13/API 33. */
-    private static final class Api34ModelDownload {
-        static void trigger(Activity activity, SpeechRecognizer recognizer, Intent intent) {
-            recognizer.triggerModelDownload(intent, activity.getMainExecutor(), new ModelDownloadListener() {
-                @Override public void onProgress(int completedPercent) {
-                    offlineModelStatus = "PROGRESS";
-                    Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                            + " download_status=PROGRESS progress_percent=" + completedPercent);
-                }
-
-                @Override public void onSuccess() {
-                    persistModelResult(activity, "SUCCESS", 0, false);
-                    Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                            + " download_status=SUCCESS");
-                    try { recognizer.destroy(); } catch (Throwable ignored) {}
-                    scheduleOfflineSupportRecheck(activity, 250L);
-                }
-
-                @Override public void onScheduled() {
-                    persistModelResult(activity, "SCHEDULED", 0, false);
-                    Log.i(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                            + " download_status=SCHEDULED");
-                    try { recognizer.destroy(); } catch (Throwable ignored) {}
-                    scheduleOfflineSupportRecheck(activity, MODEL_RECHECK_DELAY_MS);
-                }
-
-                @Override public void onError(int error) {
-                    persistModelResult(activity, "FAILED", error, false);
-                    Log.e(TAG, "[AndroidSTTModelDownload] language=" + LANGUAGE
-                            + " download_status=ERROR error_code=" + error);
-                    try { recognizer.destroy(); } catch (Throwable ignored) {}
-                }
-            });
-        }
-    }
 
     private static String recognizerService(Context context, Mode mode) {
         String configured = "";
@@ -1027,11 +1337,12 @@ public final class AndroidSpeechRecognizerBridge {
     }
 
     private static void failSession(Session session, int code, String message, boolean ignored) {
-        if (session == null || session.finalSent) return;
+        if (session == null || session.finalSent || session.terminalDelivered) return;
+        session.finalSent = true;
+        session.terminalDelivered = true;
         state = State.ERROR;
         sendEvent(session, "ERROR", null, code, message, state);
-        destroyRecognizer(session);
-        synchronized (LOCK) { if (activeSession == session) activeSession = null; }
+        resetTerminalSession(session);
     }
 
     private static void sendImmediateError(String id, String requested, String target, String callback,
@@ -1041,12 +1352,83 @@ public final class AndroidSpeechRecognizerBridge {
         sendEvent(session, "ERROR", null, code, message, State.ERROR);
     }
 
-    private static void destroyRecognizer(Session session) {
+    private static void resetTerminalSession(Session session) {
+        session.activeRecognizerGeneration++;
+        releaseRecognizer(session, false);
+        synchronized (LOCK) {
+            if (activeSession == session) activeSession = null;
+            state = State.IDLE;
+        }
+    }
+
+    private static void releaseRecognizer(Session session, boolean cancelFirst) {
+        if (session == null) return;
         SpeechRecognizer recognizer = session.recognizer;
-        session.recognizer = null;
         if (recognizer != null) {
+            if (cancelFirst) {
+                try { recognizer.cancel(); } catch (Throwable t) { Log.w(TAG, "Recognizer cancel failed", t); }
+            }
+            try { recognizer.setRecognitionListener(null); } catch (Throwable ignored) {}
             try { recognizer.destroy(); } catch (Throwable t) { Log.w(TAG, "Recognizer destroy failed", t); }
         }
+        session.recognizer = null;
+    }
+
+    private static void refreshRecognizerAvailability(Context context) {
+        if (context == null) {
+            standardServiceAvailable = false;
+            onDeviceServiceAvailable = false;
+            onlineUsable = false;
+            offlineUsable = false;
+            return;
+        }
+        try {
+            standardServiceAvailable = SpeechRecognizer.isRecognitionAvailable(context);
+        } catch (Throwable ignored) {
+            standardServiceAvailable = false;
+        }
+        onlineUsable = standardServiceAvailable;
+        refreshOnDeviceAvailability(context);
+    }
+
+    private static boolean refreshOnDeviceAvailability(Context context) {
+        boolean available = false;
+        if (context != null && Build.VERSION.SDK_INT >= 31) {
+            try {
+                available = SpeechRecognizer.isOnDeviceRecognitionAvailable(context);
+            } catch (Throwable ignored) {}
+        }
+        onDeviceServiceAvailable = available;
+        offlineUsable = available;
+        return available;
+    }
+
+    private static String usedModeLogName(Mode mode) {
+        return mode == Mode.OFFLINE ? "ON_DEVICE" : mode.name();
+    }
+
+    private static void logLifecycleCallback(Session session, String callback) {
+        Log.i(TAG, String.format(Locale.US,
+                "[AndroidSTT] session_id=%s requested_mode=%s used_mode=%s retry_reason=%s "
+                        + "on_device_available=%s retry_count=%d recognizer_recreated=%s "
+                        + "language=%s callback=%s",
+                session.id, session.requested, usedModeLogName(session.used), session.retryReason,
+                onDeviceServiceAvailable, session.retriedOnDevice ? 1 : 0, session.attempt > 1,
+                LANGUAGE, callback));
+    }
+
+    private static String sessionError(Session session, int error, boolean onDeviceAvailable) {
+        if (session.used == Mode.ONLINE && isNetworkError(error) && !onDeviceAvailable) {
+            return "İnternet bağlantısı yok ve cihazda çevrimdışı tanıma kullanılamıyor.";
+        }
+        if (session.used == Mode.OFFLINE && error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+            NetworkDiagnostics network = networkDiagnostics(unityActivity());
+            if ("UNAVAILABLE".equals(network.state) || "false".equals(network.validated)) {
+                return "Türkçe çevrimdışı modeli hazırlamak için internet bağlantısını geçici olarak açın.";
+            }
+            return "Türkçe çevrimdışı model seçili konuşma servisinde kullanılamıyor.";
+        }
+        return userError(error);
     }
 
     private static boolean matches(Session session, String id) {
@@ -1055,10 +1437,10 @@ public final class AndroidSpeechRecognizerBridge {
     private static boolean isTerminal(State value) {
         return value == State.COMPLETED || value == State.CANCELLED || value == State.ERROR || value == State.DESTROYED;
     }
-    private static boolean isOnlineFailure(int error) {
-        return error == SpeechRecognizer.ERROR_NETWORK || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
-                || error == SpeechRecognizer.ERROR_SERVER
-                || (Build.VERSION.SDK_INT >= 31 && error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED);
+    private static boolean isNetworkError(int error) {
+        return error == SpeechRecognizer.ERROR_NETWORK
+                || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+                || error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED;
     }
     private static Mode parseMode(String value) {
         try { return Mode.valueOf((value == null ? "AUTO" : value.trim()).toUpperCase(Locale.ROOT)); }
@@ -1165,7 +1547,7 @@ public final class AndroidSpeechRecognizerBridge {
             Object value = field.get(null);
             return value instanceof Activity ? (Activity) value : null;
         } catch (Throwable t) {
-            Log.e(TAG, "Unity Activity unavailable", t);
+            try { Log.e(TAG, "Unity Activity unavailable", t); } catch (Throwable ignored) {}
             return null;
         }
     }
@@ -1193,7 +1575,13 @@ public final class AndroidSpeechRecognizerBridge {
         String service = "";
         int attempt;
         boolean retriedOnDevice;
+        boolean retryStarted;
+        boolean networkErrorSeen;
+        boolean networkKnownUnavailable;
         boolean finalSent;
+        boolean terminalDelivered;
+        int activeRecognizerGeneration;
+        String retryReason = "NONE";
         long listeningStartedAt;
         long speechStartedAt;
         long speechEndedAt;

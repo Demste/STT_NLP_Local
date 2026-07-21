@@ -14,10 +14,10 @@ public final class AndroidSpeechRecognizerBridgeTest {
                 "ONLINE", false, true, 33, true, true));
     }
 
-    @Test public void offlineUsesOnlyReadyOnDeviceRecognizer() {
-        assertEquals("OFFLINE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
+    @Test public void offlineUsesAvailableOnDeviceRecognizerEvenWhenSupportListIsStale() {
+        assertEquals("ON_DEVICE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "OFFLINE", true, true, 33, true, true));
-        assertEquals("", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
+        assertEquals("ON_DEVICE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "OFFLINE", true, true, 33, true, false));
     }
 
@@ -31,14 +31,17 @@ public final class AndroidSpeechRecognizerBridgeTest {
                 "AUTO", true, true, 33, true, true));
     }
 
-    @Test public void autoUsesOnlineWithoutValidatedInternetWhenStandardServiceExists() {
-        assertEquals("ONLINE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
+    @Test public void autoUsesOnDeviceWhenNetworkIsKnownUnavailable() {
+        assertEquals("ON_DEVICE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "AUTO", false, true, 33, true, true));
+        assertEquals("NETWORK_UNAVAILABLE_ON_DEVICE_AVAILABLE",
+                AndroidSpeechRecognizerBridge.selectionReasonForTesting(
+                        "AUTO", "UNAVAILABLE", "false", true, 33, true, true));
     }
 
-    @Test public void autoUsesOnlineWhenNetworkUnknownAndOfflineIsMissing() {
+    @Test public void autoUsesOnlineWhenNetworkUnknown() {
         assertEquals("ONLINE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
-                "AUTO", false, true, 33, true, false));
+                "AUTO", "UNKNOWN", "unknown", true, 33, true, false));
         assertEquals("STANDARD_SERVICE_AVAILABLE", AndroidSpeechRecognizerBridge.selectionReasonForTesting(
                 "AUTO", true, 33, true, false));
     }
@@ -52,45 +55,30 @@ public final class AndroidSpeechRecognizerBridgeTest {
                 "ONLINE", "ONLINE", false, true, SpeechRecognizer.ERROR_NETWORK));
         assertFalse(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
                 "AUTO", "ONLINE", false, false, SpeechRecognizer.ERROR_NETWORK));
+        assertTrue(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
+                "AUTO", "ONLINE", false, true, SpeechRecognizer.ERROR_NETWORK_TIMEOUT));
+        assertTrue(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
+                "AUTO", "ONLINE", false, true, SpeechRecognizer.ERROR_SERVER_DISCONNECTED));
+        assertFalse(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
+                "AUTO", "ONLINE", false, true, SpeechRecognizer.ERROR_SERVER));
     }
 
-    @Test public void modelDownloadApiBranchAndProcessSpamPolicyAreCorrect() {
-        long now = 1_000_000_000L;
-        assertEquals("LEGACY_TRIGGER", AndroidSpeechRecognizerBridge.downloadMethodForTesting(33));
-        assertEquals("LISTENER_TRIGGER", AndroidSpeechRecognizerBridge.downloadMethodForTesting(34));
-        assertEquals("UNSUPPORTED", AndroidSpeechRecognizerBridge.downloadMethodForTesting(32));
-        assertTrue(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, false, "NONE", 0L, now, false));
-        assertFalse(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, true, "REQUESTED", now, now, false));
-        assertFalse(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                32, false, false, "NONE", 0L, now, false));
-        assertFalse(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, true, false, "NONE", 0L, now, false));
-    }
-
-    @Test public void persistedDownloadRetryPolicyUsesCooldownAndForcedRetry() {
-        long now = 2_000_000_000L;
-        assertFalse(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, false, "REQUESTED", now - 1000L, now, false));
-        assertFalse(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, false, "FAILED", now - 1000L, now, false));
-        assertTrue(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, false, "FAILED", now - 7L * 60L * 60L * 1000L, now, false));
-        assertTrue(AndroidSpeechRecognizerBridge.shouldStartModelDownloadForTesting(
-                33, false, true, "REQUESTED", now, now, true));
-    }
-
-    @Test public void downloadSuccessAndPendingStatesRequestSupportRecheck() {
-        assertTrue(AndroidSpeechRecognizerBridge.shouldRecheckAfterDownloadStatusForTesting("SUCCESS"));
-        assertTrue(AndroidSpeechRecognizerBridge.shouldRecheckAfterDownloadStatusForTesting("REQUESTED"));
-        assertTrue(AndroidSpeechRecognizerBridge.shouldRecheckAfterDownloadStatusForTesting("SCHEDULED"));
-        assertFalse(AndroidSpeechRecognizerBridge.shouldRecheckAfterDownloadStatusForTesting("FAILED"));
+    @Test public void autoLanguageUnavailableRetriesOnlyAfterNetworkErrorWasSeen() {
+        assertTrue(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
+                "AUTO", "ONLINE", false, true, true,
+                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE));
+        assertFalse(AndroidSpeechRecognizerBridge.shouldRetryOnDeviceForTesting(
+                "AUTO", "ONLINE", false, true, false,
+                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE));
     }
 
     @Test public void networkAndBusyErrorsHaveUserSafeMessages() {
-        assertEquals("Ağ bağlantısı yok veya zaman aşımına uğradı.",
-                AndroidSpeechRecognizerBridge.userErrorForTesting(SpeechRecognizer.ERROR_NETWORK));
+        assertEquals("İnternet bağlantısı yok ve cihazda çevrimdışı tanıma kullanılamıyor.",
+                AndroidSpeechRecognizerBridge.sessionErrorForTesting(
+                        "ONLINE", SpeechRecognizer.ERROR_NETWORK, false));
+        assertEquals("Türkçe çevrimdışı model seçili konuşma servisinde kullanılamıyor.",
+                AndroidSpeechRecognizerBridge.sessionErrorForTesting(
+                        "OFFLINE", SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE, true));
         assertEquals("Tanıma servisi meşgul, tekrar deneyin.",
                 AndroidSpeechRecognizerBridge.userErrorForTesting(SpeechRecognizer.ERROR_RECOGNIZER_BUSY));
     }
@@ -118,12 +106,12 @@ public final class AndroidSpeechRecognizerBridgeTest {
                 true, SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT));
     }
 
-    @Test public void offlineModelMissingDoesNotBlockOnlineButBlocksExplicitOffline() {
+    @Test public void recognitionSupportModelListDoesNotBlockRealOnDeviceStart() {
         assertEquals("ONLINE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "AUTO", true, true, 33, true, false));
         assertEquals("ONLINE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "ONLINE", true, true, 33, true, false));
-        assertEquals("", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
+        assertEquals("ON_DEVICE", AndroidSpeechRecognizerBridge.selectModeNameForTesting(
                 "OFFLINE", true, true, 33, true, false));
     }
 

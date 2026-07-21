@@ -1,8 +1,7 @@
 # llama_command native backend
 
-This project currently ships Whisper as a prebuilt native library in `src/main/jniLibs`.
-There is no Android CMake build configured in `build.gradle`, so enabling CMake here should
-be done deliberately and tested against the existing Whisper/STT flow.
+This project ships the command LLM as a prebuilt native library in `src/main/jniLibs`.
+There is no Android CMake build configured in `build.gradle`.
 
 The Java side is prepared for a prebuilt llama.cpp JNI library:
 
@@ -17,7 +16,7 @@ Recommended next integration path:
 
 1. Build llama.cpp for Android `arm64-v8a` outside Unity/Gradle first.
 2. Add a thin JNI adapter named `libllama_command.so`.
-3. Place it beside the existing Whisper library under `src/main/jniLibs/arm64-v8a`.
+3. Place it under `src/main/jniLibs/arm64-v8a`.
 4. Place the GGUF model under `src/main/assets/llm/command-model.gguf`.
 5. Run the current STT smoke test and then the NLP pipeline test on device.
 

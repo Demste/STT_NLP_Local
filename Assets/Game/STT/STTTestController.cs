@@ -18,7 +18,6 @@ namespace Game.STT
 {
     public sealed class STTTestController : MonoBehaviour
     {
-        private const float BridgeTimeoutSeconds = 60f;
         private const float PipelineTimeoutSeconds = 90f;
         private const string WakeWord = "Kartal";
         private const string EmptyTranscriptMessage = "Boş transcript";
@@ -31,11 +30,6 @@ namespace Game.STT
 
         [Header("Android Speech Recognizer")]
         [SerializeField] private AndroidSpeechRecognitionMode speechRecognitionMode = AndroidSpeechRecognitionMode.AUTO;
-
-        [Header("Recording")]
-        [SerializeField] private int sampleRate = 16000;
-        [SerializeField] private int maxRecordSeconds = 30;
-        [SerializeField] private float recordingTailSeconds = 0.35f;
 
         [Header("Pipeline")]
         [SerializeField] private SpeechCommandPipeline speechCommandPipeline;
@@ -54,21 +48,11 @@ namespace Game.STT
         [SerializeField] private SpeechCommandRecoveryView commandRecoveryView;
 
         private readonly STTProvider _activeProvider = STTProvider.AndroidSpeechRecognizer;
-        private const STTProvider LegacyWhisperProvider = STTProvider.WhisperCppOffline;
-        private MicrophoneRecorder _recorder;
         private STTSessionStorage _storage;
         private STTAndroidBridgeClient _bridgeClient;
+        private AndroidSttModelPromptController _modelPrompt;
         private IAndroidSpeechRecognizerClient _speechRecognizerClient;
-        private string _lastWavPath;
-        private string _lastRecordingLabel;
-        private string _expectedProviderApi;
-        private string _expectedAudioPath;
-        private string _lastRecordingDebugLine;
-        private int _recordingIndex;
         private bool _busy;
-
-        private bool _pendingCompleted;
-        private STTResult _pendingResult;
         private CancellationTokenSource _pipelineCancellation;
         private CancellationTokenSource _confirmationCancellation;
         private int _requestSequence;
@@ -91,6 +75,12 @@ namespace Game.STT
             _bridgeClient = new STTAndroidBridgeClient();
             _speechRecognizerClient = _bridgeClient;
             _warmupCoordinator = ModelWarmupCoordinator.Shared;
+            _modelPrompt = GetComponent<AndroidSttModelPromptController>();
+            if (_modelPrompt == null)
+            {
+                _modelPrompt = gameObject.AddComponent<AndroidSttModelPromptController>();
+            }
+            _modelPrompt.Configure(_bridgeClient, message => SetStatus(message));
 
             SetupDropdown();
 
@@ -101,7 +91,7 @@ namespace Game.STT
 
             SetStatus("Android konuşma tanıma hazırlanıyor");
             SetRecordButtonInteractable(false);
-            SetWhisperResult(string.Empty);
+            SetTranscriptResult(string.Empty);
             SetNlpJsonResult(string.Empty);
             SetTimingText(RequestTiming.Empty, 0);
             SetFilesText();
@@ -145,6 +135,7 @@ namespace Game.STT
                 if (this != null && isActiveAndEnabled)
                 {
                     HandleWarmupProgress(result);
+                    _modelPrompt?.EvaluateAfterWarmup(result);
                 }
             }
             catch (Exception ex)
@@ -239,7 +230,7 @@ namespace Game.STT
                 + "-" + timing.pressAtUnixMs.ToString(CultureInfo.InvariantCulture);
             _recognitionSessionActive = true;
             SetStatus("Dinleniyor...", requestId);
-            SetWhisperResult(string.Empty, requestId);
+            SetTranscriptResult(string.Empty, requestId);
             SetNlpJsonResult(string.Empty, requestId);
             SetTimingText(timing, requestId);
             _speechRecognizerClient.StartSpeechRecognition(
@@ -292,7 +283,7 @@ namespace Game.STT
                     ? speechEvent.alternatives[0]?.text ?? string.Empty : string.Empty;
                 if (!string.IsNullOrWhiteSpace(partial))
                 {
-                    SetWhisperResult(partial, requestId);
+                    SetTranscriptResult(partial, requestId);
                     Debug.Log($"[AndroidSTTPartial] session_id={speechEvent.session_id} elapsed_ms={ElapsedSince(timing.pressAtUnixMs)} text=\"{EscapeForLog(partial)}\"");
                 }
                 return;
@@ -356,7 +347,7 @@ namespace Game.STT
         private IEnumerator CoHandleAndroidFinal(AndroidSpeechCandidateSelection selection, int requestId)
         {
             string transcript = selection?.selectedTranscript?.Trim() ?? string.Empty;
-            SetWhisperResult(transcript, requestId);
+            SetTranscriptResult(transcript, requestId);
             if (string.IsNullOrWhiteSpace(transcript))
             {
                 FinishWithoutNlp(requestId, GetTiming(requestId), NoDroneCommandMessage, NoDroneCommandMessage, WakeWordParseResult.NoWakeWord);
@@ -415,167 +406,6 @@ namespace Game.STT
             _recognitionSessionActive = false;
             _busy = false;
             _activeSpeechSessionId = string.Empty;
-        }
-
-        private IEnumerator CoStopSaveTranscribeAndParse(int requestId)
-        {
-            _busy = true;
-            SetRecordButtonInteractable(false);
-
-            AudioClip clip;
-            if (_recorder.IsRecording && recordingTailSeconds > 0f)
-            {
-                yield return new WaitForSeconds(recordingTailSeconds);
-            }
-
-            try
-            {
-                clip = _recorder.StopAndGetClip();
-                SetStatus("Ses kaydı durduruldu", requestId);
-            }
-            catch (Exception ex)
-            {
-                _busy = false;
-                SetRecordButtonInteractable(true);
-                SetStatus("Hata: " + ex.Message, requestId);
-                yield break;
-            }
-
-            _lastRecordingLabel = GetNextRecordingLabel();
-            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-            _lastWavPath = _storage.BuildAudioPath(_lastRecordingLabel, timestamp);
-
-            try
-            {
-                WavEncoder.SaveToFile(clip, _lastWavPath);
-                long wavFileSizeBytes = GetFileSizeBytes(_lastWavPath);
-                _lastRecordingDebugLine =
-                    $"Recorded: {_recorder.LastRecordedDurationSeconds:F2}s, " +
-                    $"samples={_recorder.LastRecordedSamples}, " +
-                    $"channels={_recorder.LastChannels}, " +
-                    $"freq={_recorder.LastFrequency}, " +
-                    $"tail={recordingTailSeconds:F2}s, " +
-                    $"wav={wavFileSizeBytes} bytes";
-                _storage.AppendRecordingHeader(_lastRecordingLabel, _lastWavPath);
-                ExportLastAudioToPublicDocuments();
-                SetFilesText();
-            }
-            catch (Exception ex)
-            {
-                _busy = false;
-                SetRecordButtonInteractable(true);
-                SetStatus("Hata: WAV kaydedilemedi: " + ex.Message, requestId);
-                yield break;
-            }
-
-            yield return CoTranscribeWhisperAndHandleResult(requestId);
-
-            _storage.AppendRecordingSeparator();
-            ExportResultToPublicDocuments();
-            SetFilesText();
-            _busy = false;
-            SetRecordButtonInteractable(true);
-        }
-
-        private IEnumerator CoTranscribeWhisperAndHandleResult(int requestId)
-        {
-            _expectedProviderApi = LegacyWhisperProvider.ToApiValue();
-            _expectedAudioPath = _lastWavPath;
-            _pendingCompleted = false;
-            _pendingResult = null;
-
-            SetStatus("Whisper işleniyor", requestId);
-            RequestTiming timing = GetTiming(requestId);
-            timing.totalStopwatch.Restart();
-            timing.whisperStopwatch.Restart();
-            _bridgeClient.Transcribe(
-                LegacyWhisperProvider,
-                _lastWavPath,
-                language,
-                gameObject.name,
-                nameof(OnAndroidSTTResult)
-            );
-
-            float started = Time.realtimeSinceStartup;
-            while (!_pendingCompleted && Time.realtimeSinceStartup - started < BridgeTimeoutSeconds)
-            {
-                yield return null;
-            }
-
-            if (!IsLatestRequest(requestId))
-            {
-                Debug.Log($"[STT] request_id={requestId} stale Whisper result ignored.");
-                yield break;
-            }
-
-            timing.whisperStopwatch.Stop();
-            timing.whisperSeconds = timing.whisperStopwatch.Elapsed.TotalSeconds;
-            timing.hasWhisperTiming = true;
-
-            STTResult result = _pendingResult;
-            if (!_pendingCompleted)
-            {
-                result = BuildErrorResult("Android bridge callback timeout.");
-            }
-            else if (result == null)
-            {
-                result = BuildErrorResult("Bridge result null döndü.");
-            }
-
-            _storage.AppendModelOutput(LegacyWhisperProvider, result);
-
-            if (result.HasError)
-            {
-                timing.totalStopwatch.Stop();
-                timing.totalSeconds = timing.totalStopwatch.Elapsed.TotalSeconds;
-                timing.hasTotalTiming = true;
-                timing.finalStatus = "Hata: " + result.error;
-                SetTimingText(timing, requestId);
-                LogTotalDuration(requestId, timing.totalSeconds, timing.finalStatus);
-                SetWhisperResult(string.Empty, requestId);
-                SetStatus("Hata: " + result.error, requestId);
-                SetNlpJsonResult("Hata: " + result.error, requestId);
-                yield break;
-            }
-
-            string rawTranscript = result.text ?? string.Empty;
-            string transcript = rawTranscript.Trim();
-            Debug.Log(
-                $"[STT] request_id={requestId} whisper_duration={FormatSeconds(timing.whisperSeconds)} " +
-                $"raw_transcript=\"{EscapeForLog(rawTranscript)}\" normalized_transcript=\"{EscapeForLog(transcript)}\"");
-            SetStatus("Whisper sonucu alındı", requestId);
-            SetWhisperResult(transcript, requestId);
-            SetTimingText(timing, requestId);
-
-            if (string.IsNullOrWhiteSpace(transcript))
-            {
-                FinishWithoutNlp(requestId, timing, "Boş transcript veya ses algılanmadı", string.Empty, WakeWordParseResult.EmptyTranscript);
-                yield break;
-            }
-
-            SetStatus("Wake word kontrol ediliyor", requestId);
-            timing.wakeWordStopwatch.Restart();
-            WakeWordParseResult wakeWordResult = TryExtractCommandAfterWakeWord(transcript);
-            timing.wakeWordStopwatch.Stop();
-            timing.wakeWordSeconds = timing.wakeWordStopwatch.Elapsed.TotalSeconds;
-            timing.hasWakeWordTiming = true;
-            timing.wakeResult = wakeWordResult;
-            LogWakeWordDuration(requestId, timing.wakeWordSeconds, wakeWordResult);
-            SetTimingText(timing, requestId);
-
-            if (!wakeWordResult.foundWakeWord)
-            {
-                FinishWithoutNlp(requestId, timing, NoDroneCommandMessage, NoDroneCommandMessage, wakeWordResult);
-                yield break;
-            }
-
-            if (!wakeWordResult.hasCommand)
-            {
-                FinishWithoutNlp(requestId, timing, MissingCommandMessage, MissingCommandMessage, wakeWordResult);
-                yield break;
-            }
-
-            yield return CoRunNlp(wakeWordResult.cleanedCommand, rawTranscript, requestId);
         }
 
         private IEnumerator CoRunNlp(string cleanCommand, string rawTranscript, int requestId)
@@ -676,52 +506,8 @@ namespace Game.STT
             LogTotalDuration(requestId, timing.totalSeconds, timing.finalStatus);
         }
 
-        // Android Java bridge UnityPlayer.UnitySendMessage ile burayı çağırır.
-        public void OnAndroidSTTResult(string json)
-        {
-            try
-            {
-                STTResult parsed = JsonUtility.FromJson<STTResult>(json);
-
-                if (parsed == null)
-                {
-                    _pendingResult = BuildErrorResult("JSON parse sonucu null. Raw: " + json);
-                    _pendingCompleted = true;
-                    return;
-                }
-
-                if (!string.IsNullOrEmpty(_expectedProviderApi) && parsed.provider != _expectedProviderApi)
-                {
-                    Debug.LogWarning($"[STT] Eski/farklı provider callback ignore edildi. Expected={_expectedProviderApi}, Got={parsed.provider}");
-                    return;
-                }
-
-                if (!string.IsNullOrEmpty(_expectedAudioPath) &&
-                    !string.IsNullOrEmpty(parsed.audioFile) &&
-                    parsed.audioFile != _expectedAudioPath)
-                {
-                    Debug.LogWarning($"[STT] Eski/farklı audio callback ignore edildi. Expected={_expectedAudioPath}, Got={parsed.audioFile}");
-                    return;
-                }
-
-                _pendingResult = parsed;
-                _pendingCompleted = true;
-            }
-            catch (Exception ex)
-            {
-                _pendingResult = BuildErrorResult("JSON parse hatası: " + ex.Message + " Raw: " + json);
-                _pendingCompleted = true;
-            }
-        }
-
         public void ShareTxt()
         {
-            if (_recordingIndex == 0)
-            {
-                SetStatus("Paylaşılacak kayıt yok.");
-                return;
-            }
-
             if (_storage == null || string.IsNullOrWhiteSpace(_storage.ResultTxtPath) || !File.Exists(_storage.ResultTxtPath))
             {
                 SetStatus("Paylaşılacak TXT dosyası yok.");
@@ -730,57 +516,6 @@ namespace Game.STT
 
             bool started = _bridgeClient.ShareTextFile(_storage.ResultTxtPath);
             SetStatus(started ? "TXT paylaşımı açıldı." : "Share TXT sadece Android build içinde çalışır.");
-        }
-
-        private bool ExportLastAudioToPublicDocuments()
-        {
-            if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_lastWavPath)) return false;
-            if (!HasUsableFile(_lastWavPath, 44)) return false;
-            return _bridgeClient.ExportFileToPublicDocuments(_lastWavPath, _storage.SessionId, "audio/wav");
-        }
-
-        private bool ExportResultToPublicDocuments()
-        {
-            if (_bridgeClient == null || _storage == null || string.IsNullOrWhiteSpace(_storage.ResultTxtPath)) return false;
-            if (!HasUsableFile(_storage.ResultTxtPath, 0)) return false;
-            return _bridgeClient.ExportFileToPublicDocuments(_storage.ResultTxtPath, _storage.SessionId, "text/plain");
-        }
-
-        private static bool HasUsableFile(string path, long minSizeBytes)
-        {
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return false;
-            return new FileInfo(path).Length > minSizeBytes;
-        }
-
-        private static long GetFileSizeBytes(string path)
-        {
-            return File.Exists(path) ? new FileInfo(path).Length : 0;
-        }
-
-        private string GetNextRecordingLabel()
-        {
-            int index = _recordingIndex++;
-
-            if (index < 26)
-            {
-                char label = (char)('a' + index);
-                return label.ToString();
-            }
-
-            return $"recording_{index + 1:000}";
-        }
-
-        private STTResult BuildErrorResult(string error)
-        {
-            return new STTResult
-            {
-                provider = LegacyWhisperProvider.ToApiValue(),
-                language = language,
-                text = string.Empty,
-                durationMs = 0,
-                audioFile = _lastWavPath,
-                error = error
-            };
         }
 
         private static WakeWordParseResult TryExtractCommandAfterWakeWord(string transcript)
@@ -1002,8 +737,6 @@ namespace Game.STT
             commandRecoveryView?.ClearForNewTranscript();
             _uiGeneration++;
             _activeRequestId = ++_requestSequence;
-            _pendingCompleted = false;
-            _pendingResult = null;
             RequestTiming timing = RequestTiming.Empty;
             timing.requestId = _activeRequestId;
             _requestTimings[_activeRequestId] = timing;
@@ -1039,7 +772,7 @@ namespace Game.STT
             Debug.Log(requestId > 0 ? $"[STT] request_id={requestId} status={message}" : "[STT] " + message);
         }
 
-        private void SetWhisperResult(string transcript, int requestId = 0)
+        private void SetTranscriptResult(string transcript, int requestId = 0)
         {
             if (requestId > 0 && !IsLatestRequest(requestId))
             {
@@ -1148,10 +881,8 @@ namespace Game.STT
                 $"App storage root: {_storage.RootDirectory}\n" +
                 $"Session: {_storage.SessionId}\n" +
                 $"App result: {_storage.ResultTxtPath}\n" +
-                $"App last audio: {_lastWavPath}\n" +
                 $"Public visible folder: {_storage.PublicFolderDisplayPath}\n" +
-                $"Public result: {_storage.PublicResultDisplayPath}\n" +
-                $"{_lastRecordingDebugLine}";
+                $"Public result: {_storage.PublicResultDisplayPath}";
         }
 
         private static string BuildNlpJsonResult(string cleanCommand, SpeechCommandPipelineResult result)
@@ -1510,15 +1241,12 @@ namespace Game.STT
 
             public int requestId;
             public readonly Stopwatch totalStopwatch = new Stopwatch();
-            public readonly Stopwatch whisperStopwatch = new Stopwatch();
             public readonly Stopwatch wakeWordStopwatch = new Stopwatch();
             public readonly Stopwatch nlpStopwatch = new Stopwatch();
-            public double whisperSeconds;
             public double androidSttSeconds;
             public double wakeWordSeconds;
             public double nlpSeconds;
             public double totalSeconds;
-            public bool hasWhisperTiming;
             public bool hasAndroidSttTiming;
             public bool hasWakeWordTiming;
             public bool hasNlpTiming;

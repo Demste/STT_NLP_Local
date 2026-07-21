@@ -2,7 +2,7 @@
 
 Bu klasör, Unity Android plugin için kullanılan offline LLM backend'inin native JNI adapter'ını build etmek için vardır.
 
-Bu workspace `Assets/Plugins/Android/STTBridge.androidlib` dışında durur. Böylece mevcut Whisper/STT Android plugin yapısı bozulmaz ve Unity/Gradle tarafına yeni bir CMake entegrasyonu eklenmez.
+Bu workspace `Assets/Plugins/Android/STTBridge.androidlib` dışında durur. Böylece Android STT plugin yapısı etkilenmez ve Unity/Gradle tarafına yeni bir CMake entegrasyonu eklenmez.
 
 Build varsayılan olarak:
 

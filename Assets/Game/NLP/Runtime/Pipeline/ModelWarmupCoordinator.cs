@@ -39,16 +39,13 @@ namespace Game.NLP
         public string sttSelectionReason;
         public bool modelDownloadRequested;
         public string androidSupportMessage;
-        public bool whisperReady;
         public bool pythonReady;
         public bool spacyReady;
         public bool llmReady;
-        public bool whisperContextReused;
         public bool pythonRuntimeReused;
         public bool spacyModelReused;
         public bool llmModelReused;
         public long warmupStartedAtUnixMs;
-        public long whisperDurationMs;
         public long pythonSpacyDurationMs;
         public long llmDurationMs;
         public long totalDurationMs;
@@ -208,9 +205,6 @@ namespace Game.NLP
                     snapshot.sttSelectionReason = value.selection_reason ?? string.Empty;
                     snapshot.modelDownloadRequested = value.model_download_requested;
                     snapshot.androidSupportMessage = value.error ?? string.Empty;
-                    snapshot.whisperReady = false;
-                    snapshot.whisperContextReused = false;
-                    snapshot.whisperDurationMs = 0;
                 });
             }
 

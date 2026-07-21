@@ -86,6 +86,27 @@ namespace Game.STT
         public bool warmup_success;
     }
 
+    [Serializable]
+    public sealed class AndroidSttModelActionResult
+    {
+        public bool ok;
+        public string model_status;
+        public bool network_validated;
+        public string provider;
+        public string error;
+    }
+
+    [Serializable]
+    public sealed class AndroidSttModelEvent
+    {
+        public string event_name;
+        public string provider;
+        public string model_status;
+        public bool installed;
+        public bool pending;
+        public string reason;
+    }
+
     public static class AndroidSttConfidence
     {
         public const float GoodThreshold = 0.80f;

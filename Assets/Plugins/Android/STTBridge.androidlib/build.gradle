@@ -22,7 +22,7 @@ android {
         consumerProguardFiles 'consumer-rules.pro'
 
         ndk {
-            // Whisper/STT + Chaquopy Python runtime için gerçek cihaz hedefi.
+            // Android STT + Chaquopy Python runtime için gerçek cihaz hedefi.
             abiFilters 'arm64-v8a'
         }
     }
@@ -170,4 +170,5 @@ rootProject.subprojects {
 
 dependencies {
     implementation 'androidx.core:core:1.12.0'
+    testImplementation 'junit:junit:4.13.2'
 }
