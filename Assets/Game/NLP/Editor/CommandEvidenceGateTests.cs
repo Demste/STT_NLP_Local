@@ -112,6 +112,24 @@ namespace Game.NLP.EditorTests
             Assert.IsNull(result.validated.missing_field);
         }
 
+        [Test]
+        public async Task ProductionRouterCallsBoundedSlotLlmForSpokenNonCanonicalObject()
+        {
+            analysisJson = SlotAnalysisEnvelope();
+            llmJson = SlotLlmEnvelope();
+
+            SpeechCommandPipelineResult result = await pipeline.ProcessTranscriptAsync(
+                "ağır vasıtayı bul", default, "slot-routing-test", "Kartal ağır vasıtayı bul");
+
+            Assert.AreEqual(1, llmCalls, "production LLM interface must be called exactly once");
+            Assert.IsTrue(result.llmCalled);
+            Assert.AreEqual("slot_llm", result.resolutionSource);
+            Assert.AreEqual("slot_llm_validated", result.llm.stage);
+            Assert.AreEqual("FIND_OBJECT", result.validated.action);
+            Assert.AreEqual("TRUCK", result.validated.@object);
+            Assert.AreEqual("RESOLVED", result.finalResolutionStatus);
+        }
+
         private void SetBackend()
         {
             SetField("analyzeAsync", new Func<string, string, CancellationToken, Task<string>>(
@@ -168,6 +186,38 @@ namespace Game.NLP.EditorTests
                 .Replace("\"llm_called\":false", "\"llm_called\":true")
                 .Replace("\"inference_ran\":false", "\"inference_ran\":true")
                 .Replace("\"resolution_source\":\"baseline\"", "\"resolution_source\":\"action_llm\"");
+        }
+
+        private static string SlotAnalysisEnvelope()
+        {
+            return "{\"ok\":true,\"analysis_input\":\"ağır vasıtayı bul\","
+                + "\"resolution_status\":\"NEEDS_SLOT_CLASSIFICATION\",\"resolution_source\":\"pending_llm\","
+                + "\"semantic_frame\":{\"raw_text\":\"ağır vasıtayı bul\",\"candidate_actions\":[\"FIND_OBJECT\"],"
+                + "\"safety_blocked\":false,\"object_spans\":[{\"type\":\"OBJECT\",\"field\":\"object\","
+                + "\"text\":\"ağır vasıtayı\",\"start\":0,\"end\":13,\"canonical_value\":null,"
+                + "\"source\":\"spacy_predicate_object_phrase\"}]},"
+                + "\"baseline_hints\":{\"final_parser\":false,\"resolution_status\":\"NEEDS_SLOT_CLASSIFICATION\","
+                + "\"resolution_source\":\"pending_llm\",\"detected_object_phrase\":\"ağır vasıtayı\","
+                + "\"command_candidate\":{\"action\":\"MISSING_INFO\",\"target_action\":\"FIND_OBJECT\","
+                + "\"missing_field\":\"object\",\"confidence\":0.88},"
+                + "\"recovery_resolution_status\":\"NO_RECOVERY\",\"suggestions\":[],"
+                + "\"action_evidence\":{\"has_any\":true,\"supported_actions\":[\"FIND_OBJECT\"],"
+                + "\"reasons\":[\"predicate\"],\"source_text\":\"ağır vasıtayı bul\"},"
+                + "\"evidence_supported_actions\":[\"FIND_OBJECT\"]},"
+                + "\"drone_command\":{\"action\":\"MISSING_INFO\",\"target_action\":\"FIND_OBJECT\","
+                + "\"missing_field\":\"object\",\"confidence\":0.88}}";
+        }
+
+        private static string SlotLlmEnvelope()
+        {
+            string command = "{\"action\":\"FIND_OBJECT\",\"object\":\"TRUCK\",\"confidence\":0.82}";
+            return DroneCommandJsonParser.BuildBaselineEnvelope(
+                    "Kartal ağır vasıtayı bul", "ağır vasıtayı bul", "ağır vasıtayı bul",
+                    "RESOLVED", false, command, 1)
+                .Replace("\"stage\":\"baseline_resolved\"", "\"stage\":\"slot_llm_validated\"")
+                .Replace("\"llm_called\":false", "\"llm_called\":true")
+                .Replace("\"inference_ran\":false", "\"inference_ran\":true")
+                .Replace("\"resolution_source\":\"baseline\"", "\"resolution_source\":\"slot_llm\"");
         }
     }
 }

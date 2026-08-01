@@ -3,6 +3,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -21,8 +22,61 @@ struct LlamaCommandContext {
     llama_context* ctx = nullptr;
     const llama_vocab* vocab = nullptr;
     int context_size = 0;
+    int last_prompt_tokens = 0;
+    int last_output_tokens = 0;
+    int64_t last_prompt_eval_ms = 0;
+    int64_t last_first_token_ms = 0;
+    int64_t last_generation_ms = 0;
+    int64_t last_total_ms = 0;
+    bool last_json_early_stop = false;
     std::mutex mutex;
 };
+
+using SteadyClock = std::chrono::steady_clock;
+
+int64_t elapsed_ms(SteadyClock::time_point started) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - started).count();
+}
+
+size_t balanced_root_end(const std::string& value) {
+    size_t start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos || value[start] != '{') {
+        return std::string::npos;
+    }
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = start; i < value.size(); ++i) {
+        const char c = value[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\' && in_string) {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+        if (c == '{') ++depth;
+        if (c == '}' && --depth == 0) return i;
+        if (depth < 0) return std::string::npos;
+    }
+    return std::string::npos;
+}
+
+void reset_metrics(LlamaCommandContext* state) {
+    state->last_prompt_tokens = 0;
+    state->last_output_tokens = 0;
+    state->last_prompt_eval_ms = 0;
+    state->last_first_token_ms = 0;
+    state->last_generation_ms = 0;
+    state->last_total_ms = 0;
+    state->last_json_early_stop = false;
+}
 
 std::string jstring_to_utf8(JNIEnv* env, jstring value) {
     if (value == nullptr) {
@@ -191,7 +245,8 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
     jint max_tokens,
     jfloat temperature,
     jfloat top_p,
-    jint top_k) {
+    jint top_k,
+    jstring grammar_value) {
     auto* state = reinterpret_cast<LlamaCommandContext*>(handle);
     if (state == nullptr || state->ctx == nullptr || state->model == nullptr) {
         return env->NewStringUTF("NATIVE_ERROR: nativeGenerate called with invalid handle");
@@ -200,11 +255,15 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
     std::lock_guard<std::mutex> lock(state->mutex);
 
     try {
+        reset_metrics(state);
+        const auto total_started = SteadyClock::now();
         std::string prompt = jstring_to_utf8(env, prompt_value);
+        std::string grammar = jstring_to_utf8(env, grammar_value);
         std::vector<llama_token> tokens = tokenize(state, prompt);
         const int limit = std::max<int>(1, max_tokens);
         const int safety_margin = 32;
         const int prompt_tokens = static_cast<int>(tokens.size());
+        state->last_prompt_tokens = prompt_tokens;
         const int context_size = std::max<int>(state->context_size, 512);
 
         __android_log_print(
@@ -238,10 +297,12 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
 
         llama_memory_clear(llama_get_memory(state->ctx), true);
 
+        const auto prompt_eval_started = SteadyClock::now();
         llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
         if (llama_decode(state->ctx, batch) != 0) {
             return env->NewStringUTF("NATIVE_ERROR: llama_decode_failed_for_prompt");
         }
+        state->last_prompt_eval_ms = elapsed_ms(prompt_eval_started);
 
         std::string output;
         float temp = std::max<float>(0.0f, temperature);
@@ -257,6 +318,15 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
             return nullptr;
         }
 
+        if (!grammar.empty()) {
+            llama_sampler* grammar_sampler = llama_sampler_init_grammar(
+                state->vocab, grammar.c_str(), "root");
+            if (grammar_sampler == nullptr) {
+                return env->NewStringUTF("NATIVE_ERROR: invalid_grammar");
+            }
+            llama_sampler_chain_add(sampler.get(), grammar_sampler);
+        }
+
         if (temp <= 0.0f) {
             llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
         } else {
@@ -266,11 +336,13 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
             llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         }
 
+        const auto generation_started = SteadyClock::now();
         for (int i = 0; i < limit; ++i) {
             llama_token next = llama_sampler_sample(sampler.get(), state->ctx, -1);
-            llama_sampler_accept(sampler.get(), next);
+            state->last_output_tokens = i + 1;
 
             if (i == 0) {
+                state->last_first_token_ms = elapsed_ms(generation_started);
                 __android_log_print(
                     ANDROID_LOG_INFO,
                     kLogTag,
@@ -288,6 +360,13 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
 
             output += token_to_piece(state, next);
 
+            const size_t json_end = balanced_root_end(output);
+            if (json_end != std::string::npos) {
+                output.resize(json_end + 1);
+                state->last_json_early_stop = true;
+                break;
+            }
+
             llama_token next_tokens[] = {next};
             llama_batch next_batch = llama_batch_get_one(next_tokens, 1);
             if (llama_decode(state->ctx, next_batch) != 0) {
@@ -295,11 +374,20 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
             }
         }
 
+        state->last_generation_ms = elapsed_ms(generation_started);
+        state->last_total_ms = elapsed_ms(total_started);
+
         __android_log_print(
             ANDROID_LOG_INFO,
             kLogTag,
-            "nativeGenerate output_chars=%zu",
-            output.size());
+            "nativeGenerate output_chars=%zu output_tokens=%d prompt_eval_ms=%lld first_token_ms=%lld generation_ms=%lld total_ms=%lld json_early_stop=%d",
+            output.size(),
+            state->last_output_tokens,
+            static_cast<long long>(state->last_prompt_eval_ms),
+            static_cast<long long>(state->last_first_token_ms),
+            static_cast<long long>(state->last_generation_ms),
+            static_cast<long long>(state->last_total_ms),
+            state->last_json_early_stop ? 1 : 0);
 
         if (output.empty()) {
             return env->NewStringUTF("NATIVE_ERROR: empty_generation_no_tokens");
@@ -312,6 +400,24 @@ Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGenerate(
     } catch (...) {
         return env->NewStringUTF("NATIVE_ERROR: nativeGenerate failed");
     }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mehmet_sttbridge_llm_LlamaCppEngine_nativeGetLastMetrics(
+    JNIEnv* env,
+    jclass,
+    jlong handle) {
+    auto* state = reinterpret_cast<LlamaCommandContext*>(handle);
+    if (state == nullptr) return env->NewStringUTF("{}");
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const std::string json = "{\"prompt_tokens\":" + std::to_string(state->last_prompt_tokens)
+        + ",\"output_tokens\":" + std::to_string(state->last_output_tokens)
+        + ",\"prompt_eval_ms\":" + std::to_string(state->last_prompt_eval_ms)
+        + ",\"first_token_ms\":" + std::to_string(state->last_first_token_ms)
+        + ",\"generation_ms\":" + std::to_string(state->last_generation_ms)
+        + ",\"total_ms\":" + std::to_string(state->last_total_ms)
+        + ",\"json_early_stop\":" + (state->last_json_early_stop ? "true" : "false") + "}";
+    return env->NewStringUTF(json.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL

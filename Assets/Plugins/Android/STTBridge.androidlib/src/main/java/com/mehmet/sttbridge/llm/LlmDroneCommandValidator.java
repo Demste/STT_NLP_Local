@@ -85,11 +85,18 @@ public final class LlmDroneCommandValidator {
         while (names.hasNext()) {
             String field = names.next();
             if (!"object".equals(field) && !"evidence".equals(field)) {
-                warnings.put("slot_llm_field_removed:" + field);
+                errors.put("slot_llm_field_not_allowed:" + field);
             }
         }
 
         String intendedAction = upper(action);
+        if (errors.length() > 0) {
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+        if (semanticSafetyBlocked(baseline)) {
+            errors.put("semantic_safety_blocked");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
         if (!hasActionEvidence(baseline, intendedAction)) {
             errors.put("action_evidence_absent:" + intendedAction);
             warnings.put("semantic_slot_rejected_without_action_evidence:" + intendedAction);
@@ -97,7 +104,7 @@ public final class LlmDroneCommandValidator {
         }
         if (!LlmCommandSchema.supportsObject(intendedAction)) {
             errors.put("object_not_allowed_for_action");
-            return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
         }
 
         if (baseline != null && intendedAction.equals(evidenceAction(baseline)) && baseline.has("object")) {
@@ -108,24 +115,99 @@ public final class LlmDroneCommandValidator {
         String object = upper(model.opt("object"));
         String evidence = model.optString("evidence", "").trim();
         if ("NONE".equals(object)) {
-            warnings.put("slot_llm_returned_none");
-            return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
+            errors.put("slot_llm_returned_none");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
         }
         if (!LlmCommandSchema.isObject(object)) {
             errors.put("object_not_allowed");
-            return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
         }
         if (evidence.isEmpty() || !containsEvidence(analysisInput, evidence)) {
             errors.put("slot_evidence_not_in_analysis_input");
-            return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
         }
-        String detected = baseline != null ? baseline.optString("detected_object_phrase", "") : "";
-        if (!detected.isEmpty() && !evidenceOverlaps(detected, evidence)) {
-            errors.put("slot_evidence_conflicts_with_detected_phrase");
-            return build(intendedAction, new JSONObject(), context, .0, errors, warnings);
+        if (!rawObjectEvidenceMatches(baseline, analysisInput, evidence)) {
+            errors.put("slot_evidence_not_in_raw_semantic_frame");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
         }
         JSONObject trusted = new JSONObject().put("object", object);
         return build(intendedAction, trusted, context, .82, errors, warnings);
+    }
+
+    /** Validates the closed action-specific semantic result used by production routing. */
+    public static Result validateSemanticResult(JSONObject modelOutput, JSONObject baseline,
+                                                String analysisInput, JSONObject context) throws JSONException {
+        JSONObject model = modelOutput != null ? modelOutput : new JSONObject();
+        JSONArray errors = new JSONArray();
+        JSONArray warnings = new JSONArray();
+        Iterator<String> names = model.keys();
+        while (names.hasNext()) {
+            String field = names.next();
+            if (!"action".equals(field) && !"action_evidence".equals(field) && !"slots".equals(field)) {
+                warnings.put("llm_field_removed:not_semantic_field:" + field);
+            }
+        }
+
+        String action = upper(model.opt("action"));
+        if (!LlmCommandSchema.isClassifiableAction(action)) {
+            errors.put("action_not_allowed");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+        if (semanticSafetyBlocked(baseline)) {
+            errors.put("semantic_safety_blocked");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+        if (!hasActionEvidence(baseline, action)) {
+            errors.put("action_evidence_absent:" + action);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+
+        String actionEvidence = model.optString("action_evidence", "").trim();
+        if (actionEvidence.isEmpty() || !containsEvidence(analysisInput, actionEvidence)) {
+            errors.put("action_evidence_not_in_analysis_input");
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+        if (!actionEvidenceMatchesFrame(baseline, action, actionEvidence)) {
+            errors.put("action_evidence_semantic_mismatch:" + action);
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+
+        JSONObject trusted = new JSONObject();
+        JSONObject slots = model.optJSONObject("slots");
+        if (model.has("slots") && slots == null) {
+            errors.put("slots_not_object");
+        }
+        if (slots != null) {
+            Iterator<String> slotNames = slots.keys();
+            Set<String> allowed = LlmCommandSchema.fieldsFor(action);
+            while (slotNames.hasNext()) {
+                String field = slotNames.next();
+                if (!allowed.contains(field)) {
+                    errors.put("slot_not_allowed_for_action:" + field);
+                    continue;
+                }
+                JSONObject semanticSlot = slots.optJSONObject(field);
+                if (semanticSlot == null || !semanticSlot.has("value")) {
+                    errors.put("slot_payload_invalid:" + field);
+                    continue;
+                }
+                String evidence = semanticSlot.optString("evidence", "").trim();
+                if (evidence.isEmpty() || !containsEvidence(analysisInput, evidence)) {
+                    errors.put("slot_evidence_not_in_analysis_input:" + field);
+                    continue;
+                }
+                Object value = semanticSlot.opt("value");
+                if (!semanticSlotSupported(field, value, evidence, baseline)) {
+                    errors.put("slot_evidence_semantic_mismatch:" + field);
+                    continue;
+                }
+                trusted.put(field, value);
+            }
+        }
+        if (errors.length() > 0) {
+            return build("UNKNOWN", new JSONObject(), context, .0, errors, warnings);
+        }
+        return build(action, trusted, context, .82, errors, warnings);
     }
 
     private static Result build(String intendedAction, JSONObject evidence, JSONObject context, double confidence, JSONArray errors, JSONArray warnings) throws JSONException {
@@ -185,6 +267,124 @@ public final class LlmDroneCommandValidator {
             return false;
         }
         return action.equals(evidenceAction(evidence));
+    }
+
+    private static boolean semanticSafetyBlocked(JSONObject baseline) {
+        JSONObject frame = baseline != null ? baseline.optJSONObject("semantic_frame") : null;
+        return frame != null && frame.optBoolean("safety_blocked", false);
+    }
+
+    private static boolean actionEvidenceMatchesFrame(JSONObject baseline, String action, String evidence) {
+        JSONObject frame = baseline != null ? baseline.optJSONObject("semantic_frame") : null;
+        if (frame == null) return true;
+        JSONObject predicateEvidence = frame.optJSONObject("predicate_evidence");
+        String expected = predicateEvidence != null ? predicateEvidence.optString(action, "") : "";
+        if (!expected.isEmpty()) return evidenceOverlaps(expected, evidence);
+        JSONArray lemmas = frame.optJSONArray("predicate_lemmas");
+        if (lemmas != null) {
+            String normalizedEvidence = normalize(evidence);
+            for (int i = 0; i < lemmas.length(); i++) {
+                String lemma = normalize(lemmas.optString(i, ""));
+                if (!lemma.isEmpty() && (normalizedEvidence.contains(lemma) || lemma.contains(normalizedEvidence))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean semanticSlotSupported(String field, Object value, String evidence, JSONObject baseline) {
+        JSONObject frame = baseline != null ? baseline.optJSONObject("semantic_frame") : null;
+        JSONArray spans = frame != null ? frame.optJSONArray("protected_spans") : null;
+        if (spans == null) return false;
+
+        String expectedType = slotSpanType(field);
+        String expectedUnit = slotUnit(field);
+        for (int i = 0; i < spans.length(); i++) {
+            JSONObject span = spans.optJSONObject(i);
+            if (span == null || !evidenceOverlaps(span.optString("text", ""), evidence)) continue;
+            if (!expectedType.isEmpty() && !expectedType.equals(span.optString("type", ""))) continue;
+            if (!expectedUnit.isEmpty() && !expectedUnit.equals(span.optString("unit", ""))) continue;
+            if (numericField(field)) {
+                double left = number(value, Double.NaN);
+                double right = number(span.opt("value"), Double.NaN);
+                return Double.isFinite(left) && Double.isFinite(right) && Math.abs(left - right) < 0.000001;
+            }
+            if ("coordinate".equals(field)) {
+                return value instanceof JSONObject && coordinateEquals((JSONObject) value, span.optJSONObject("value"));
+            }
+            return upper(value).equals(upper(span.opt("value")));
+        }
+        if ("location_keyword".equals(field)) {
+            return containsEvidence(analysisInputFromBaseline(baseline), evidence)
+                    && normalize(String.valueOf(value)).equals(normalize(evidence));
+        }
+        return false;
+    }
+
+    private static boolean rawObjectEvidenceMatches(JSONObject baseline, String analysisInput, String evidence) {
+        JSONObject frame = baseline != null ? baseline.optJSONObject("semantic_frame") : null;
+        JSONArray spans = frame != null ? frame.optJSONArray("object_spans") : null;
+        String raw = frame != null ? frame.optString("raw_text", "") : "";
+        if (spans == null || raw.isEmpty()) return false;
+        for (int i = 0; i < spans.length(); i++) {
+            JSONObject span = spans.optJSONObject(i);
+            if (span == null || !"OBJECT".equals(span.optString("type", ""))) continue;
+            if (!"object".equals(span.optString("field", ""))) continue;
+            if (!"spacy_predicate_object_phrase".equals(span.optString("source", ""))) continue;
+            if (span.has("value") && !span.isNull("value")) continue;
+            if (span.has("canonical_value") && !span.isNull("canonical_value")) continue;
+            String text = span.optString("text", "");
+            int start = span.optInt("start", -1);
+            int end = span.optInt("end", -1);
+            if (text.isEmpty() || start < 0 || end <= start || end > raw.length()) continue;
+            if (!text.equals(raw.substring(start, end))) continue;
+            if (!containsEvidence(analysisInput, text)) continue;
+            if (text.equals(evidence)) return true;
+        }
+        return false;
+    }
+
+    private static String analysisInputFromBaseline(JSONObject baseline) {
+        return baseline != null ? baseline.optString("analysis_input", "") : "";
+    }
+
+    private static String slotSpanType(String field) {
+        if ("direction".equals(field) || "turn_direction".equals(field)) return "DIRECTION";
+        if ("object".equals(field)) return "OBJECT";
+        if ("color".equals(field)) return "COLOR";
+        if ("shape".equals(field)) return "SHAPE";
+        if ("coordinate".equals(field)) return "COORDINATE";
+        if ("marker_index".equals(field)) return "MARKER_INDEX";
+        if (numericField(field)) return "QUANTITY";
+        return "";
+    }
+
+    private static String slotUnit(String field) {
+        if ("distance_m".equals(field)) return "METER";
+        if ("duration_s".equals(field)) return "SECOND";
+        if ("duration_min".equals(field)) return "MINUTE";
+        if ("angle_deg".equals(field)) return "DEGREE";
+        if ("speed_kmh".equals(field)) return "KMH";
+        return "";
+    }
+
+    private static boolean numericField(String field) {
+        return "distance_m".equals(field) || "duration_s".equals(field)
+                || "duration_min".equals(field) || "angle_deg".equals(field)
+                || "speed_kmh".equals(field) || "marker_index".equals(field);
+    }
+
+    private static boolean coordinateEquals(JSONObject left, JSONObject right) {
+        if (left == null || right == null) return false;
+        double leftLat = number(left.opt("lat"), Double.NaN);
+        double leftLon = number(left.opt("lon"), Double.NaN);
+        double rightLat = number(right.opt("lat"), Double.NaN);
+        double rightLon = number(right.opt("lon"), Double.NaN);
+        return Double.isFinite(leftLat) && Double.isFinite(leftLon)
+                && Double.isFinite(rightLat) && Double.isFinite(rightLon)
+                && Math.abs(leftLat - rightLat) < 0.000001
+                && Math.abs(leftLon - rightLon) < 0.000001;
     }
 
     private static String firstMissing(String action, JSONObject out, JSONObject evidence) {

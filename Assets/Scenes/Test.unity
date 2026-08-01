@@ -783,7 +783,7 @@ MonoBehaviour:
   m_Name:
   m_EditorClassIdentifier: Assembly-CSharp::Game.NLP.SpeechCommandPipeline
   config:
-    configJson: '{"version":3,"unknown_action":"UNKNOWN","missing_action":"MISSING_INFO","allowed_actions":[{"id":"TAKE_OFF"},{"id":"LAND_HOME"},{"id":"LAND_CURRENT"},{"id":"LAND_AT_WAIT_POINT"},{"id":"MOVE_DIRECTION"},{"id":"MOVE_VERTICAL"},{"id":"SET_SPEED"},{"id":"TURN"},{"id":"FIND_OBJECT"},{"id":"TRACK_OBJECT"},{"id":"HOLD_OVER_OBJECT"},{"id":"OBSERVE_CURRENT"},{"id":"GO_TO_LOCATION"},{"id":"HOVER"},{"id":"FIND_MARKER"},{"id":"STOP"},{"id":"MISSING_INFO"},{"id":"UNKNOWN"}],"llm":{"max_tokens":128,"classification_max_tokens":32,"slot_max_tokens":64,"temperature":0.1,"top_p":0.95,"top_k":40,"context_size":1024,"threads":4}}'
+    configJson: '{"version":3,"unknown_action":"UNKNOWN","missing_action":"MISSING_INFO","allowed_actions":[{"id":"TAKE_OFF"},{"id":"LAND_HOME"},{"id":"LAND_CURRENT"},{"id":"LAND_AT_WAIT_POINT"},{"id":"MOVE_DIRECTION"},{"id":"MOVE_VERTICAL"},{"id":"SET_SPEED"},{"id":"TURN"},{"id":"FIND_OBJECT"},{"id":"TRACK_OBJECT"},{"id":"HOLD_OVER_OBJECT"},{"id":"OBSERVE_CURRENT"},{"id":"GO_TO_LOCATION"},{"id":"HOVER"},{"id":"FIND_MARKER"},{"id":"STOP"},{"id":"MISSING_INFO"},{"id":"UNKNOWN"}],"llm":{"max_tokens":128,"classification_max_tokens":32,"slot_max_tokens":24,"temperature":0.1,"top_p":0.95,"top_k":40,"context_size":1024,"threads":4}}'
 --- !u!4 &211964761
 Transform:
   m_ObjectHideFlags: 0
@@ -4407,13 +4407,13 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 2102779571}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: e8784cb3cbeb49b8999194fd40b0d45e, type: 3}
   m_Name:
   m_EditorClassIdentifier: Assembly-CSharp::Game.NLP.SpeechCommandDebugPanel
-  pipeline: {fileID: 0}
-  transcriptInput: {fileID: 0}
+  pipeline: {fileID: 211964760}
+  transcriptInput: {fileID: 2073025539}
   parseButton: {fileID: 0}
   statusText: {fileID: 0}
   commandText: {fileID: 0}

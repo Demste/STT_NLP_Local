@@ -77,6 +77,135 @@ def make_suggestion(candidate: Dict[str, Any], request_key: str, multiple: bool)
     }
 
 
+def build_semantic_recovery_suggestions(
+    value: str,
+    request_key: str,
+    semantic_frame: Dict[str, Any],
+    existing: List[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Create at most three action-diverse, slot-preserving natural commands."""
+    if semantic_frame.get("safety_blocked"):
+        return []
+
+    result = list(existing or [])
+    seen_actions = {
+        str(item.get("suggested_action") or "")
+        for item in result if isinstance(item, dict)
+    }
+    actions = list(semantic_frame.get("candidate_actions") or [])
+    directions = semantic_frame.get("direction_spans") or []
+    objects = semantic_frame.get("object_spans") or []
+    quantities = semantic_frame.get("quantity_spans") or []
+    normalized = str(semantic_frame.get("normalized_text") or normalize_turkish_text(value or ""))
+
+    if directions and not actions:
+        actions.extend(("TURN", "MOVE_DIRECTION"))
+    if objects and "ilgilen" in normalized:
+        actions = ["TRACK_OBJECT", "FIND_OBJECT"] + actions
+
+    candidates = []
+    for action in actions:
+        if action in seen_actions or action in ("UNKNOWN", "MISSING_INFO"):
+            continue
+        command = _semantic_command(action, directions, objects, quantities)
+        if not command:
+            continue
+        score = 0.82 if not candidates else max(0.72, 0.79 - 0.03 * len(candidates))
+        candidates.append({
+            "corrected_suffix": command,
+            "candidate_action": action,
+            "confidence": score,
+            "reason": "SEMANTIC_CANDIDATE",
+            "critical_conflict": False,
+        })
+        seen_actions.add(action)
+
+    multiple = len(candidates) + len(result) > 1
+    for candidate in candidates:
+        result.append(make_suggestion(candidate, request_key, multiple=multiple))
+        if len(result) >= 3:
+            break
+    return result[:3]
+
+
+def _semantic_command(action: str, directions, objects, quantities) -> str:
+    direction = directions[0] if directions else None
+    object_span = objects[0] if objects else None
+    distance = next((item for item in quantities if item.get("unit") == "METER"), None)
+    angle = next((item for item in quantities if item.get("unit") == "DEGREE"), None)
+    direction_text = _direction_text(direction)
+    object_text = _natural_object(object_span)
+
+    if action == "MOVE_DIRECTION" and direction_text:
+        return "{}{} ilerle".format(direction_text, " " + _quantity_text(distance) if distance else "")
+    if action == "MOVE_VERTICAL":
+        vertical = direction_text or "yukarı"
+        return "{}{} hareket et".format(vertical, " " + _quantity_text(distance) if distance else "")
+    if action == "TURN" and direction_text:
+        return "{}{} dön".format(direction_text, " " + _quantity_text(angle) if angle else "")
+    if action == "TRACK_OBJECT" and object_text:
+        return object_text + " takip et"
+    if action == "FIND_OBJECT" and object_text:
+        return object_text + " bul"
+    if action == "HOLD_OVER_OBJECT" and object_text:
+        return object_text + " üzerinde bekle"
+    if action == "OBSERVE_CURRENT":
+        return "Burada gözlem yap"
+    if action == "LAND_HOME":
+        return "Başlangıç noktasına dön"
+    if action == "LAND_CURRENT":
+        return "Bulunduğun yere in"
+    if action == "HOVER":
+        return "Havada bekle"
+    if action == "STOP":
+        return "Dur"
+    return ""
+
+
+def _direction_text(span: Dict[str, Any]) -> str:
+    if not span:
+        return ""
+    return {
+        "LEFT": "sola",
+        "RIGHT": "sağa",
+        "FORWARD": "ileri",
+        "BACKWARD": "geri",
+        "UP": "yukarı",
+        "DOWN": "aşağı",
+    }.get(str(span.get("value") or ""), str(span.get("text") or "").strip())
+
+
+def _quantity_text(span: Dict[str, Any]) -> str:
+    if not span:
+        return ""
+    value = span.get("value")
+    unit = {
+        "METER": "metre",
+        "DEGREE": "derece",
+        "SECOND": "saniye",
+        "MINUTE": "dakika",
+        "KMH": "km/h",
+    }.get(str(span.get("unit") or ""), "")
+    return "{} {}".format(value, unit).strip()
+
+
+def _natural_object(span: Dict[str, Any]) -> str:
+    if not span:
+        return ""
+    value = str(span.get("value") or "")
+    return {
+        "TRUCK": "Kamyonu",
+        "PICKUP": "Kamyoneti",
+        "CAR": "Arabayı",
+        "EXCAVATOR": "Ekskavatörü",
+        "LOADER": "Yükleyiciyi",
+        "FORKLIFT": "Forklifti",
+        "CEMENT_TRUCK": "Beton mikserini",
+        "SEMI_TRUCK": "Tırı",
+        "CRANE": "Vinci",
+    }.get(value, str(span.get("text") or "").strip())
+
+
 def _known_candidates(normalized: str) -> List[Dict[str, Any]]:
     if normalized in AMBIGUOUS_STT_VARIANTS:
         return [{

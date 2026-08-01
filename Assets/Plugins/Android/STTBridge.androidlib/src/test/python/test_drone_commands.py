@@ -3,11 +3,15 @@ import json
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from nlp_pipeline.baseline_rules import build_baseline_hints, parse_drone_command
 from nlp_pipeline.baseline_rules import parse_drone_command_with_diagnostics
 from nlp_pipeline.command_validation import materialize_public_command, validate_command
-from nlp_pipeline.schema import ACTION_IDS, DEFAULT_COMMAND_SCHEMA, PUBLIC_FIELDS, allowed_fields
+from nlp_pipeline.command_validation import validate_candidate_record
+from nlp_pipeline.command_recovery import build_semantic_recovery_suggestions
+from nlp_pipeline.semantic_routing import build_semantic_frame, resolve_semantic_candidate
+from nlp_pipeline.schema import ACTION_FIELDS, ACTION_IDS, DEFAULT_COMMAND_SCHEMA, PUBLIC_FIELDS, REQUIRED_FIELDS, allowed_fields
 from nlp_pipeline.text_normalization import normalize_turkish_key, normalize_turkish_text
 from command_parser import parse_command, validate_llm_command
 import command_parser as command_parser_module
@@ -186,7 +190,8 @@ class DroneCommandTests(unittest.TestCase):
 
         compound, diagnostics = parse_drone_command_with_diagnostics("sağa dön ve ilerle")
         self.assertEqual("UNKNOWN", compound["action"])
-        self.assertEqual("NEEDS_ACTION_CLASSIFICATION", diagnostics["resolution_status"])
+        self.assertEqual("OUT_OF_DOMAIN", diagnostics["resolution_status"])
+        self.assertTrue(diagnostics["safety_blocked"])
 
     def test_spacy_failure_stays_explicit_and_keeps_fixed_public_contract(self):
         previous_nlp = command_parser_module._nlp
@@ -250,6 +255,117 @@ class DroneCommandTests(unittest.TestCase):
                 _, diagnostics = parse_drone_command_with_diagnostics(text)
                 self.assertEqual(expected, diagnostics["resolution_status"])
 
+    def test_spacy_raw_object_phrase_routes_to_bounded_slot_classification(self):
+        previous_nlp = command_parser_module._nlp
+        previous_error = command_parser_module._load_error
+        analysis = {
+            "tokens": [
+                {"text": "ağır", "normalized_text": "agir", "pos": "ADJ"},
+                {"text": "vasıtayı", "normalized_text": "vasitayi", "pos": "ADJ"},
+                {"text": "bul", "normalized_text": "bul", "pos": "VERB"},
+            ], "entities": [],
+            "root": {"text": "bul", "lemma": "bul", "normalized_lemma": "bul"},
+            "action_candidates": [{"text": "bul", "lemma": "bul", "source": "verb_or_root"}],
+            "noun_candidates": [{"text": "vasıtayı", "lemma": "vasıta", "source": "noun_like"}],
+            "object_phrase_candidates": [],
+            "spatial_phrase_candidates": [],
+        }
+        try:
+            command_parser_module._nlp = lambda _: _FakeDoc()
+            command_parser_module._load_error = None
+            with patch.object(command_parser_module, "build_analysis", return_value=analysis):
+                payload = json.loads(parse_command(
+                    "ağır vasıtayı bul",
+                    json.dumps({"raw_transcript": "Kartal ağır vasıtayı bul", "request_id": "slot-test"}, ensure_ascii=False),
+                ))
+        finally:
+            command_parser_module._nlp = previous_nlp
+            command_parser_module._load_error = previous_error
+
+        self.assertEqual("NEEDS_SLOT_CLASSIFICATION", payload["resolution_status"])
+        self.assertEqual("pending_llm", payload["resolution_source"])
+        self.assertFalse(payload["baseline_hints"]["final_parser"])
+        self.assertEqual("ağır vasıtayı", payload["baseline_hints"]["detected_object_phrase"])
+        self.assertEqual([], payload["baseline_hints"]["suggestions"])
+        self.assertEqual("slot-test", payload["request_id"])
+        span = payload["semantic_frame"]["object_spans"][0]
+        self.assertEqual({"type": "OBJECT", "field": "object", "text": "ağır vasıtayı",
+                          "start": 0, "end": 13, "source": "spacy_predicate_object_phrase"},
+                         {key: span[key] for key in ("type", "field", "text", "start", "end", "source")})
+        self.assertIsNone(span["canonical_value"])
+        self.assertNotIn("value", span)
+
+    def test_object_slot_routing_regression_matrix(self):
+        cases = (
+            ("ağır vasıtayı bul", "NEEDS_SLOT_CLASSIFICATION"),
+            ("yük aracını takip et", "NEEDS_SLOT_CLASSIFICATION"),
+            ("kazı aracının üzerinde dur", "NEEDS_SLOT_CLASSIFICATION"),
+            ("ağır vasıtayı takip et", "NEEDS_SLOT_CLASSIFICATION"),
+            ("ağır vasıtanın üzerinde dur", "NEEDS_SLOT_CLASSIFICATION"),
+            ("beton taşıyan kamyonu bul", "RESOLVED"),
+            ("tırı bul", "RESOLVED"),
+            ("kamyonu takip et", "RESOLVED"),
+            ("forkliftin üzerinde dur", "RESOLVED"),
+            ("bul", "MISSING_USER_INFO"),
+            ("takip et", "MISSING_USER_INFO"),
+            ("biraz sağa git", "MISSING_USER_INFO"),
+            ("kamyonu takip etme", "OUT_OF_DOMAIN"),
+            ("sağa dön ve kamyonu takip et", "OUT_OF_DOMAIN"),
+            ("@@@ ???", "OUT_OF_DOMAIN"),
+        )
+        self.assertEqual(15, len(cases))
+        for text, expected_status in cases:
+            with self.subTest(text=text):
+                command, diagnostics = parse_drone_command_with_diagnostics(text)
+                self.assertEqual(expected_status, diagnostics["resolution_status"])
+                self.assertFalse(diagnostics.get("llm_called", False))
+                if expected_status == "OUT_OF_DOMAIN":
+                    self.assertEqual("UNKNOWN", command["action"])
+        malformed = json.loads(parse_command("@@@ ???"))
+        self.assertEqual("UNKNOWN", malformed["drone_command"]["action"])
+        self.assertFalse(malformed["llm_called"])
+
+    def test_modified_generic_vehicle_is_not_deterministic_car(self):
+        frame = build_semantic_frame(
+            None,
+            {"action_candidates": [{"text": "takip", "lemma": "takip"}],
+             "object_phrase_candidates": [{"text": "yük aracını", "normalized": "yuk aracini",
+                                            "head_i": 1, "head_text": "aracını"}]},
+            "yük aracını takip et",
+            build_baseline_hints({}, "yük aracını takip et"),
+        )
+        self.assertEqual(1, len(frame["object_spans"]))
+        self.assertEqual("yük aracını", frame["object_spans"][0]["text"])
+        self.assertNotIn("value", frame["object_spans"][0])
+
+    def test_predicate_anchored_raw_slot_survives_empty_spacy_object_candidates(self):
+        hints = build_baseline_hints({}, "ağır vasıtayı bul")
+        frame = build_semantic_frame(
+            None,
+            {
+                "action_candidates": [{"text": "bul", "lemma": "bul", "pos": "VERB"}],
+                "object_phrase_candidates": [],
+                "tokens": [
+                    {"text": "ağır", "normalized_text": "agir", "pos": "ADJ"},
+                    {"text": "vasıtayı", "normalized_text": "vasitayi", "pos": "ADJ"},
+                    {"text": "bul", "normalized_text": "bul", "pos": "VERB"},
+                ],
+            },
+            "ağır vasıtayı bul",
+            hints,
+        )
+        self.assertEqual(1, len(frame["object_spans"]))
+        span = frame["object_spans"][0]
+        self.assertEqual("ağır vasıtayı", span["text"])
+        self.assertEqual("spacy_token_plus_predicate_anchor", span["linguistic_basis"])
+        self.assertNotIn("value", span)
+
+        record = resolve_semantic_candidate(frame)
+        diagnostics = {}
+        command = validate_candidate_record(record, diagnostics=diagnostics)
+        self.assertEqual("MISSING_INFO", command["action"])
+        self.assertEqual("FIND_OBJECT", command["target_action"])
+
     def test_false_positive_prefixes_do_not_create_object_or_action(self):
         for text in ("Kartal tırnak işaretini bul", "Kartal bulutları izle", "Kartal durum nedir", "Kartal kabul et"):
             with self.subTest(text=text):
@@ -288,6 +404,45 @@ class DroneCommandTests(unittest.TestCase):
                 self.assertEqual(expected, values(unity, unity_name))
         self.assertEqual(PUBLIC_FIELDS, values(public_java, "PUBLIC_FIELDS"))
         self.assertEqual(PUBLIC_FIELDS, values(unity, "PublicFields"))
+
+    def test_action_allowed_and_required_slots_are_locked(self):
+        expected_allowed = {
+            "TAKE_OFF": set(), "LAND_HOME": set(), "LAND_CURRENT": set(),
+            "LAND_AT_WAIT_POINT": set(),
+            "MOVE_DIRECTION": {"direction", "distance_m"},
+            "MOVE_VERTICAL": {"direction", "distance_m"},
+            "SET_SPEED": {"speed_kmh"},
+            "TURN": {"turn_direction", "angle_deg"},
+            "FIND_OBJECT": {"object"}, "TRACK_OBJECT": {"object"},
+            "HOLD_OVER_OBJECT": {"object"},
+            "OBSERVE_CURRENT": {"observe_mode", "duration_s", "duration_min"},
+            "GO_TO_LOCATION": {"location_keyword", "coordinate"},
+            "HOVER": {"duration_s", "duration_min"},
+            "FIND_MARKER": {"color", "shape", "marker_index"},
+            "STOP": set(), "UNKNOWN": set(),
+        }
+        expected_required = {
+            "MOVE_DIRECTION": ["direction", "distance_m"],
+            "MOVE_VERTICAL": ["direction", "distance_m"],
+            "SET_SPEED": ["speed_kmh"],
+            "TURN": ["turn_direction", "angle_deg"],
+            "FIND_OBJECT": ["object"], "TRACK_OBJECT": ["object"],
+            "HOLD_OVER_OBJECT": ["object"],
+            "GO_TO_LOCATION": ["location_keyword|coordinate"],
+            "FIND_MARKER": ["color", "shape"],
+        }
+        self.assertEqual(expected_allowed, ACTION_FIELDS)
+        self.assertEqual(expected_required, REQUIRED_FIELDS)
+
+        java = (Path(__file__).parents[2] / "main/java/com/mehmet/sttbridge/llm/LlmCommandSchema.java").read_text(encoding="utf-8")
+        self.assertIn('value.put("TURN", new String[] {"turn_direction", "angle_deg"});', java)
+        for action, fields in expected_allowed.items():
+            match = re.search(
+                r'value\.put\("' + action + r'", fields\((?P<fields>.*?)\)\);',
+                java,
+            )
+            self.assertIsNotNone(match, action)
+            self.assertEqual(fields, set(re.findall(r'"([a-z_]+)"', match.group("fields"))))
 
     def test_all_binding_alias_variants_are_deterministic(self):
         object_aliases = {
@@ -520,6 +675,97 @@ class DroneCommandTests(unittest.TestCase):
         self.assertNotIn("suggestions", payload["public_command"])
         self.assertTrue(payload["baseline_hints"]["correction_applied"])
 
+    def test_spacy_semantic_frame_resolves_open_turkish_without_llm(self):
+        cases = {
+            "sağ cenaha beş metre yol al": {
+                "action": "MOVE_DIRECTION", "direction": "RIGHT", "distance_m": 5,
+            },
+            "rotanı sağ tarafa kır": {
+                "action": "MISSING_INFO", "target_action": "TURN",
+                "turn_direction": "RIGHT", "missing_field": "angle_deg",
+            },
+            "irtifanı üç metre artır": {
+                "action": "MOVE_VERTICAL", "direction": "UP", "distance_m": 3,
+            },
+            "tırı göz hapsinde tut": {
+                "action": "TRACK_OBJECT", "object": "SEMI_TRUCK",
+            },
+            "kamyonu gözden kaçırma": {
+                "action": "TRACK_OBJECT", "object": "TRUCK",
+            },
+            "burada nöbet tut": {
+                "action": "OBSERVE_CURRENT", "observe_mode": "WATCH",
+            },
+            "başlangıç noktasına geri çekil": {
+                "action": "LAND_HOME",
+            },
+        }
+        previous_nlp = command_parser_module._nlp
+        previous_error = command_parser_module._load_error
+        try:
+            command_parser_module._nlp = lambda text: _FakeDoc()
+            command_parser_module._load_error = None
+            for text, expected in cases.items():
+                with self.subTest(text=text):
+                    payload = json.loads(parse_command(text))
+                    command = payload["internal_validated_command"]
+                    for field, value in expected.items():
+                        self.assertEqual(value, command.get(field))
+                    self.assertEqual("real_spacy", payload["engine"])
+                    self.assertEqual("spacy", payload["resolution_source"])
+                    self.assertTrue(payload["baseline_hints"]["final_parser"])
+                    self.assertFalse(payload["llm_called"])
+                    self.assertTrue(payload["semantic_frame"]["protected_spans"])
+                    self.assertEqual("spacy", payload["candidate_record"]["source"])
+                    self.assertEqual(PUBLIC_FIELDS, list(payload["public_command"]))
+        finally:
+            command_parser_module._nlp = previous_nlp
+            command_parser_module._load_error = previous_error
+
+    def test_negation_multi_action_conflict_and_context_are_safety_blocked(self):
+        for text in (
+            "Kartal kamyonu takip etme",
+            "Kartal sağa dön ve ileri git",
+            "Kartal sağa ve sola dön",
+            "Kartal onu takip et",
+        ):
+            with self.subTest(text=text):
+                payload = json.loads(parse_command(text))
+                self.assertEqual("UNKNOWN", payload["public_command"]["action"])
+                self.assertEqual("action_first_baseline", payload["engine"])
+                self.assertFalse(payload["llm_called"])
+                self.assertTrue(payload["baseline_hints"]["safety_blocked"])
+
+    def test_semantic_recovery_is_action_diverse_and_preserves_slots(self):
+        movement = build_semantic_frame(None, {"action_candidates": []}, "sağ tarafa doğru kıvrıl")
+        suggestions = build_semantic_recovery_suggestions(
+            "sağ tarafa doğru kıvrıl", "movement-request", movement)
+        self.assertLessEqual(len(suggestions), 3)
+        self.assertEqual(len(suggestions), len({item["suggested_action"] for item in suggestions}))
+        self.assertTrue(all("sağ" in item["suggested_command"].lower() for item in suggestions))
+
+        object_frame = build_semantic_frame(None, {"action_candidates": []}, "kamyonla ilgilen")
+        object_suggestions = build_semantic_recovery_suggestions(
+            "kamyonla ilgilen", "object-request", object_frame)
+        self.assertEqual(["TRACK_OBJECT", "FIND_OBJECT"],
+                         [item["suggested_action"] for item in object_suggestions])
+        self.assertTrue(all("Kamyonu" in item["suggested_command"] for item in object_suggestions))
+
+    def test_candidate_validator_rejects_wrong_slot_evidence_and_numeric_unit(self):
+        frame = build_semantic_frame(None, {"action_candidates": []}, "sağ cenaha beş metre yol al")
+        record = resolve_semantic_candidate(frame)
+        record["command"]["direction"] = "LEFT"
+        diagnostics = {}
+        self.assertEqual("UNKNOWN", validate_candidate_record(record, diagnostics=diagnostics)["action"])
+        self.assertIn("enum_evidence_mismatch:direction", diagnostics["errors"])
+
+        record = resolve_semantic_candidate(frame)
+        record["command"]["distance_m"] = 5
+        record["evidence"]["distance_m"] = "beş dakika"
+        diagnostics = {}
+        self.assertEqual("UNKNOWN", validate_candidate_record(record, diagnostics=diagnostics)["action"])
+        self.assertIn("slot_evidence_not_in_transcript:distance_m", diagnostics["errors"])
+
     def test_binding_contract_sentence_matrix(self):
         cases = [
             # TAKE_OFF / landing
@@ -622,8 +868,9 @@ class DroneCommandTests(unittest.TestCase):
             ("Kartal bulutları izle", "OUT_OF_DOMAIN", {"action": "UNKNOWN", "confidence": 0.0}),
             ("Kartal tırnak işaretini bul", "OUT_OF_DOMAIN", {"action": "UNKNOWN", "confidence": 0.0}),
             ("Kartal kabul et", "OUT_OF_DOMAIN", {"action": "UNKNOWN", "confidence": 0.0}),
+            ("Kartal fotoğraf çek", "OUT_OF_DOMAIN", {"action": "UNKNOWN", "confidence": 0.0}),
         ]
-        self.assertEqual(93, len(cases))
+        self.assertEqual(94, len(cases))
         for text, expected_status, expected in cases:
             with self.subTest(text=text):
                 internal, diagnostics = parse_drone_command_with_diagnostics(text)
@@ -634,6 +881,12 @@ class DroneCommandTests(unittest.TestCase):
                 self.assertEqual(PUBLIC_FIELDS, list(public))
                 self.assertTrue(0.0 <= public["confidence"] <= 1.0)
                 self.assertNotIn(None, internal.values())
+
+
+class _FakeDoc(list):
+    @property
+    def ents(self):
+        return []
 
 
 if __name__ == "__main__":

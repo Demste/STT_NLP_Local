@@ -25,7 +25,7 @@ namespace Game.NLP
             + "{\"id\":\"FIND_OBJECT\"},{\"id\":\"TRACK_OBJECT\"},{\"id\":\"HOLD_OVER_OBJECT\"},{\"id\":\"OBSERVE_CURRENT\"},"
             + "{\"id\":\"GO_TO_LOCATION\"},{\"id\":\"HOVER\"},{\"id\":\"FIND_MARKER\"},{\"id\":\"STOP\"},{\"id\":\"MISSING_INFO\"},{\"id\":\"UNKNOWN\"}"
             + "],"
-            + "\"llm\":{\"max_tokens\":128,\"classification_max_tokens\":32,\"slot_max_tokens\":64,\"temperature\":0.1,\"classification_temperature\":0.0,\"slot_temperature\":0.0,\"top_p\":0.95,\"top_k\":40,\"context_size\":1024,\"threads\":4}}";
+            + "\"llm\":{\"max_tokens\":128,\"classification_max_tokens\":32,\"slot_max_tokens\":24,\"temperature\":0.1,\"classification_temperature\":0.0,\"slot_temperature\":0.0,\"top_p\":0.95,\"top_k\":40,\"context_size\":1024,\"threads\":4}}";
 
         public static string BuildLlmDebugJson(string sourceConfigJson)
         {
@@ -243,7 +243,7 @@ namespace Game.NLP
             public int threads = 4;
             public int max_tokens = 128;
             public int classification_max_tokens = 32;
-            public int slot_max_tokens = 64;
+            public int slot_max_tokens = 24;
             public float temperature = 0.1f;
             public float classification_temperature = 0f;
             public float slot_temperature = 0f;

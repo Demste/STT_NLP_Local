@@ -57,6 +57,16 @@ namespace Game.NLP
         public int llm_output_tokens;
         public bool llm_output_tokens_exact;
         public long llm_generation_duration;
+        public long llm_generation_duration_ms;
+        public long llm_prompt_eval_duration;
+        public long llm_prompt_eval_duration_ms;
+        public long llm_first_token_duration;
+        public long llm_first_token_duration_ms;
+        public long llm_parse_duration;
+        public long llm_parse_duration_ms;
+        public long llm_native_total_duration_ms;
+        public long llm_total_duration;
+        public long llm_total_duration_ms;
         public long validation_duration;
         public long validation_duration_ms;
         public long total_duration_ms;

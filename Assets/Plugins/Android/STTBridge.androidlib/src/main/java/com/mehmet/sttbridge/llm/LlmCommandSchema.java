@@ -89,7 +89,7 @@ public final class LlmCommandSchema {
         JSONObject llm = new JSONObject();
         llm.put("max_tokens", 128); // legacy/general ceiling
         llm.put("classification_max_tokens", 32);
-        llm.put("slot_max_tokens", 64);
+        llm.put("slot_max_tokens", 24);
         llm.put("temperature", 0.1);
         llm.put("classification_temperature", 0.0);
         llm.put("slot_temperature", 0.0);
@@ -151,7 +151,7 @@ public final class LlmCommandSchema {
         value.put("MOVE_DIRECTION", new String[] {"direction", "distance_m"});
         value.put("MOVE_VERTICAL", new String[] {"direction", "distance_m"});
         value.put("SET_SPEED", new String[] {"speed_kmh"});
-        value.put("TURN", new String[] {"turn_direction"});
+        value.put("TURN", new String[] {"turn_direction", "angle_deg"});
         value.put("FIND_OBJECT", new String[] {"object"});
         value.put("TRACK_OBJECT", new String[] {"object"});
         value.put("HOLD_OVER_OBJECT", new String[] {"object"});

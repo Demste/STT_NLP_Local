@@ -197,7 +197,7 @@ namespace Game.NLP.EditorTests
             Assert.AreEqual(CommandRecoveryStatus.NeedsConfirmation, pending.recovery.resolution_status);
             Assert.IsNull(pending.finalJson);
             Assert.IsNull(pending.validated);
-            Assert.IsFalse(pending.llmCalled);
+            Assert.IsTrue(pending.llmCalled);
         }
 
         [Test]
@@ -284,7 +284,7 @@ namespace Game.NLP.EditorTests
             Assert.NotNull(llmField);
             analyzeField.SetValue(pipeline, analyze);
             llmField.SetValue(pipeline, new Func<string, string, string, CancellationToken, Task<string>>(
-                (text, nlp, config, token) => Task.FromException<string>(new AssertionException("LLM must not be called."))));
+                (text, nlp, config, token) => Task.FromResult(UnknownLlmEnvelope())));
         }
 
         private void InvokeLifecycle(string methodName)
@@ -307,7 +307,7 @@ namespace Game.NLP.EditorTests
         {
             string suggestionsJson = string.Join(",", suggestions.Select(SuggestionJson));
             return "{\"ok\":true,\"analysis_input\":\"" + input + "\",\"resolution_status\":\"NEEDS_CONFIRMATION\","
-                + "\"baseline_hints\":{\"final_parser\":true,\"resolution_status\":\"NEEDS_CONFIRMATION\","
+                + "\"baseline_hints\":{\"final_parser\":false,\"resolution_status\":\"NEEDS_ACTION_CLASSIFICATION\","
                 + "\"command_candidate\":{\"action\":\"UNKNOWN\",\"confidence\":0},"
                 + "\"original_suffix\":\"" + input + "\",\"normalized_suffix\":\"" + input + "\","
                 + "\"correction_applied\":false,\"correction_confidence\":0.8,"
@@ -315,6 +315,18 @@ namespace Game.NLP.EditorTests
                 + "\"recovery_resolution_status\":\"NEEDS_CONFIRMATION\",\"suggestions\":[" + suggestionsJson + "],"
                 + "\"parser_input\":\"" + input + "\",\"parser_source\":\"deterministic_original\"},"
                 + "\"drone_command\":{\"action\":\"UNKNOWN\",\"confidence\":0}}";
+        }
+
+        private static string UnknownLlmEnvelope()
+        {
+            string envelope = DroneCommandJsonParser.BuildBaselineEnvelope(
+                "ambiguous", "ambiguous", "ambiguous", "UNKNOWN", false,
+                "{\"action\":\"UNKNOWN\",\"confidence\":0}", 1);
+            return envelope
+                .Replace("\"stage\":\"baseline_resolved\"", "\"stage\":\"semantic_llm_validated\"")
+                .Replace("\"llm_called\":false", "\"llm_called\":true")
+                .Replace("\"inference_ran\":false", "\"inference_ran\":true")
+                .Replace("\"resolution_source\":\"baseline\"", "\"resolution_source\":\"semantic_llm\"");
         }
 
         private static string ResolvedEnvelope(string input, string action)

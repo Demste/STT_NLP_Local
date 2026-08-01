@@ -314,7 +314,7 @@ namespace Game.NLP.EditorTests
         {
             SetField(pipeline, "analyzeAsync", analyze);
             SetField(pipeline, "parseLlmAsync", new Func<string, string, string, CancellationToken, Task<string>>(
-                (text, nlp, config, token) => Task.FromException<string>(new AssertionException("LLM must not be called."))));
+                (text, nlp, config, token) => Task.FromResult(UnknownLlmEnvelope())));
         }
 
         private static void SetField(object target, string fieldName, object value)
@@ -341,7 +341,7 @@ namespace Game.NLP.EditorTests
         private static string PendingEnvelope()
         {
             return "{\"ok\":true,\"analysis_input\":\"ambiguous\",\"resolution_status\":\"NEEDS_CONFIRMATION\","
-                + "\"baseline_hints\":{\"final_parser\":true,\"resolution_status\":\"NEEDS_CONFIRMATION\","
+                + "\"baseline_hints\":{\"final_parser\":false,\"resolution_status\":\"NEEDS_ACTION_CLASSIFICATION\","
                 + "\"command_candidate\":{\"action\":\"UNKNOWN\",\"confidence\":0},"
                 + "\"original_suffix\":\"ambiguous\",\"normalized_suffix\":\"ambiguous\","
                 + "\"correction_applied\":false,\"recovery_resolution_status\":\"NEEDS_CONFIRMATION\","
@@ -349,6 +349,18 @@ namespace Game.NLP.EditorTests
                 + "\"suggested_command\":\"bekle\",\"suggested_action\":\"STOP\",\"confidence\":0.8}],"
                 + "\"parser_input\":\"ambiguous\",\"parser_source\":\"deterministic_original\"},"
                 + "\"drone_command\":{\"action\":\"UNKNOWN\",\"confidence\":0}}";
+        }
+
+        private static string UnknownLlmEnvelope()
+        {
+            string envelope = DroneCommandJsonParser.BuildBaselineEnvelope(
+                "ambiguous", "ambiguous", "ambiguous", "UNKNOWN", false,
+                "{\"action\":\"UNKNOWN\",\"confidence\":0}", 1);
+            return envelope
+                .Replace("\"stage\":\"baseline_resolved\"", "\"stage\":\"semantic_llm_validated\"")
+                .Replace("\"llm_called\":false", "\"llm_called\":true")
+                .Replace("\"inference_ran\":false", "\"inference_ran\":true")
+                .Replace("\"resolution_source\":\"baseline\"", "\"resolution_source\":\"semantic_llm\"");
         }
 
         private static string ResolvedEnvelope(string input, string action)

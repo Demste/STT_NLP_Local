@@ -24,6 +24,7 @@ namespace Game.NLP
         public NlpToken[] tokens;
         public NlpEntity[] entities;
         public NlpAnalysis analysis;
+        public NlpSemanticFrame semantic_frame;
         public BaselineCommandHints baseline_hints;
         public ValidatedCommandResult drone_command;
         public SemanticParserStatus semantic_parser;
@@ -165,6 +166,8 @@ namespace Game.NLP
         public string parser_source;
         public ActionEvidenceSummary action_evidence;
         public string[] evidence_supported_actions;
+        public string[] semantic_validation_errors;
+        public string[] semantic_validation_warnings;
     }
 
     [Serializable]
@@ -200,5 +203,55 @@ namespace Game.NLP
         public string engine;
         public string status;
         public string message;
+    }
+
+    [Serializable]
+    public sealed class NlpSemanticFrame
+    {
+        public string raw_text;
+        public string normalized_text;
+        public string[] predicate_lemmas;
+        public bool negated;
+        public bool idiomatic_negation;
+        public int conjunct_count;
+        public bool multi_action;
+        public bool conflicting_direction;
+        public bool context_reference;
+        public NlpSemanticSpan[] object_spans;
+        public NlpSemanticSpan[] direction_spans;
+        public NlpQuantitySpan[] quantity_spans;
+        public NlpSemanticSpan[] location_spans;
+        public string[] candidate_actions;
+        public bool safety_blocked;
+        public string[] safety_reasons;
+    }
+
+    [Serializable]
+    public sealed class NlpSemanticSpan
+    {
+        public string type;
+        public string field;
+        public string text;
+        public string normalized;
+        public int start;
+        public int end;
+        public string value;
+        public string canonical_value;
+        public string source;
+        public int head_i;
+        public string head_text;
+    }
+
+    [Serializable]
+    public sealed class NlpQuantitySpan
+    {
+        public string type;
+        public string text;
+        public string normalized;
+        public int start;
+        public int end;
+        public double value;
+        public string unit;
+        public string slot;
     }
 }

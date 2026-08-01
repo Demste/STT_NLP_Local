@@ -1,10 +1,12 @@
 package com.mehmet.sttbridge.llm;
 
 import android.content.Context;
+import android.util.Log;
 
 import org.json.JSONObject;
 
 public final class LlamaCppEngine implements OfflineLlmEngine {
+    private static final String TAG = "LlamaCppEngine";
     private static final String ENGINE_NAME = "llama_cpp";
     private static final String NATIVE_LIBRARY = "llama_command";
 
@@ -20,6 +22,46 @@ public final class LlamaCppEngine implements OfflineLlmEngine {
             null,
             NATIVE_LIBRARY);
     private long nativeHandle;
+    private GenerationMetrics lastGenerationMetrics = GenerationMetrics.empty();
+
+    public static final class GenerationMetrics {
+        public final int promptTokens;
+        public final int outputTokens;
+        public final long promptEvalMs;
+        public final long firstTokenMs;
+        public final long generationMs;
+        public final long totalMs;
+        public final boolean jsonEarlyStop;
+
+        private GenerationMetrics(int promptTokens, int outputTokens, long promptEvalMs,
+                                  long firstTokenMs, long generationMs, long totalMs,
+                                  boolean jsonEarlyStop) {
+            this.promptTokens = promptTokens;
+            this.outputTokens = outputTokens;
+            this.promptEvalMs = promptEvalMs;
+            this.firstTokenMs = firstTokenMs;
+            this.generationMs = generationMs;
+            this.totalMs = totalMs;
+            this.jsonEarlyStop = jsonEarlyStop;
+        }
+
+        public static GenerationMetrics empty() {
+            return new GenerationMetrics(0, 0, 0, 0, 0, 0, false);
+        }
+
+        static GenerationMetrics fromJson(String value) {
+            try {
+                JSONObject json = new JSONObject(value != null ? value : "{}");
+                return new GenerationMetrics(
+                        json.optInt("prompt_tokens", 0), json.optInt("output_tokens", 0),
+                        json.optLong("prompt_eval_ms", 0), json.optLong("first_token_ms", 0),
+                        json.optLong("generation_ms", 0), json.optLong("total_ms", 0),
+                        json.optBoolean("json_early_stop", false));
+            } catch (Throwable ignored) {
+                return empty();
+            }
+        }
+    }
 
     public LlamaCppEngine(Context context) {
         appContext = context != null ? context.getApplicationContext() : null;
@@ -108,13 +150,26 @@ public final class LlamaCppEngine implements OfflineLlmEngine {
         }
 
         try {
+            lastGenerationMetrics = GenerationMetrics.empty();
+            Log.i(TAG, "[NLP-LlamaCpp] nativeGenerate called max_tokens="
+                    + (options != null ? options.maxTokens : 128)
+                    + " grammar_constrained=" + (options != null && !options.grammar.isEmpty()));
             String result = nativeGenerate(
                     nativeHandle,
                     prompt != null ? prompt : "",
                     options != null ? options.maxTokens : 128,
                     options != null ? options.temperature : 0.1f,
                     options != null ? options.topP : 0.95f,
-                    options != null ? options.topK : 40);
+                    options != null ? options.topK : 40,
+                    options != null ? options.grammar : "");
+            lastGenerationMetrics = GenerationMetrics.fromJson(nativeGetLastMetrics(nativeHandle));
+            Log.i(TAG, "[NLP-LlamaCpp] prompt_tokens=" + lastGenerationMetrics.promptTokens
+                    + " output_tokens=" + lastGenerationMetrics.outputTokens
+                    + " prompt_eval_ms=" + lastGenerationMetrics.promptEvalMs
+                    + " first_token_ms=" + lastGenerationMetrics.firstTokenMs
+                    + " generation_ms=" + lastGenerationMetrics.generationMs
+                    + " total_ms=" + lastGenerationMetrics.totalMs
+                    + " json_early_stop=" + lastGenerationMetrics.jsonEarlyStop);
             if (result == null || result.trim().isEmpty()) {
                 throw new IllegalStateException("llama.cpp generation returned empty output.");
             }
@@ -125,6 +180,10 @@ public final class LlamaCppEngine implements OfflineLlmEngine {
         } catch (Throwable t) {
             throw new IllegalStateException("llama.cpp generation failed: " + throwableMessage(t), t);
         }
+    }
+
+    public synchronized GenerationMetrics getLastGenerationMetrics() {
+        return lastGenerationMetrics;
     }
 
     public synchronized void close() {
@@ -171,7 +230,10 @@ public final class LlamaCppEngine implements OfflineLlmEngine {
 
     private static native long nativeInit(String modelPath, int contextSize, int threads);
 
-    private static native String nativeGenerate(long handle, String prompt, int maxTokens, float temperature, float topP, int topK);
+    private static native String nativeGenerate(long handle, String prompt, int maxTokens, float temperature,
+                                                float topP, int topK, String grammar);
+
+    private static native String nativeGetLastMetrics(long handle);
 
     private static native void nativeFree(long handle);
 }

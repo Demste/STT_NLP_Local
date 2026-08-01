@@ -13,9 +13,11 @@ public final class LlmGenerationOptions {
     public final int slotMaxTokens;
     public final float classificationTemperature;
     public final float slotTemperature;
+    public final String grammar;
 
     private LlmGenerationOptions(int maxTokens, float temperature, float topP, int topK, int contextSize, int threads,
-                                 int classificationMaxTokens, int slotMaxTokens, float classificationTemperature, float slotTemperature) {
+                                 int classificationMaxTokens, int slotMaxTokens, float classificationTemperature,
+                                 float slotTemperature, String grammar) {
         this.maxTokens = maxTokens;
         this.temperature = temperature;
         this.topP = topP;
@@ -26,6 +28,7 @@ public final class LlmGenerationOptions {
         this.slotMaxTokens = slotMaxTokens;
         this.classificationTemperature = classificationTemperature;
         this.slotTemperature = slotTemperature;
+        this.grammar = grammar != null ? grammar : "";
     }
 
     public static LlmGenerationOptions fromConfig(JSONObject config) {
@@ -37,7 +40,7 @@ public final class LlmGenerationOptions {
         int contextSize = llm != null ? llm.optInt("context_size", 1024) : 1024;
         int threads = llm != null ? llm.optInt("threads", 4) : 4;
         int classificationMaxTokens = llm != null ? llm.optInt("classification_max_tokens", 32) : 32;
-        int slotMaxTokens = llm != null ? llm.optInt("slot_max_tokens", 64) : 64;
+        int slotMaxTokens = llm != null ? llm.optInt("slot_max_tokens", 24) : 24;
         double classificationTemperature = llm != null ? llm.optDouble("classification_temperature", 0.0) : 0.0;
         double slotTemperature = llm != null ? llm.optDouble("slot_temperature", 0.0) : 0.0;
 
@@ -49,9 +52,9 @@ public final class LlmGenerationOptions {
                 clamp(contextSize, 512, 8192),
                 clamp(threads, 1, 8),
                 clamp(classificationMaxTokens, 16, 64),
-                clamp(slotMaxTokens, 32, 96),
+                clamp(slotMaxTokens, 16, 96),
                 clampTemperature(classificationTemperature),
-                clampTemperature(slotTemperature));
+                clampTemperature(slotTemperature), "");
     }
 
     public static LlmGenerationOptions forActionClassification(JSONObject config) {
@@ -66,7 +69,7 @@ public final class LlmGenerationOptions {
                 base.classificationMaxTokens,
                 base.slotMaxTokens,
                 base.classificationTemperature,
-                base.slotTemperature);
+                base.slotTemperature, "");
     }
 
     public static LlmGenerationOptions forSlotExtraction(JSONObject config) {
@@ -81,7 +84,30 @@ public final class LlmGenerationOptions {
                 base.classificationMaxTokens,
                 base.slotMaxTokens,
                 base.classificationTemperature,
-                base.slotTemperature);
+                base.slotTemperature, "");
+    }
+
+    public static LlmGenerationOptions forSlotExtraction(JSONObject config, String rawEvidence) {
+        LlmGenerationOptions base = forSlotExtraction(config);
+        return new LlmGenerationOptions(
+                base.maxTokens, base.temperature, base.topP, base.topK, base.contextSize, base.threads,
+                base.classificationMaxTokens, base.slotMaxTokens, base.classificationTemperature,
+                base.slotTemperature, LlmPromptBuilder.buildObjectGrammar(rawEvidence));
+    }
+
+    public static LlmGenerationOptions forSemanticExtraction(JSONObject config) {
+        LlmGenerationOptions base = fromConfig(config);
+        return new LlmGenerationOptions(
+                base.maxTokens,
+                base.slotTemperature,
+                base.topP,
+                base.topK,
+                base.contextSize,
+                base.threads,
+                base.classificationMaxTokens,
+                base.slotMaxTokens,
+                base.classificationTemperature,
+                base.slotTemperature, "");
     }
 
     private static int clamp(int value, int min, int max) {

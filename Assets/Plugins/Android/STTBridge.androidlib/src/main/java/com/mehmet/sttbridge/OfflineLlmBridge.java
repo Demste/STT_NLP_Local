@@ -128,6 +128,10 @@ public final class OfflineLlmBridge {
                 return enrich(unknownJson(input, "action_evidence_absent", System.currentTimeMillis() - started, spacy), diagnostics);
             }
 
+            if ("NEEDS_SLOT_CLASSIFICATION".equals(resolutionStatus)) {
+                return classifyObjectSlot(context, config, spacy, spacyAnalysisJson, input, baseline, diagnostics, started);
+            }
+
             OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
             if (!engine.getStatus().initialized) {
                 return failureWithDiagnostics(
@@ -139,113 +143,39 @@ public final class OfflineLlmBridge {
             String slotRaw = "";
             JSONObject llmResult;
             LlmDroneCommandValidator.Result validation;
-            String resolutionSource;
-            String stage;
+            String resolutionSource = "semantic_llm";
+            String stage = "semantic_llm_validated";
             int promptTokens = 0;
             int outputTokens = 0;
             long actionDuration = 0;
             long slotDuration = 0;
             long validationStarted;
-
-            if ("NEEDS_SLOT_CLASSIFICATION".equals(resolutionStatus)) {
-                String action = evidenceAction(baseline);
-                String prompt = LlmPromptBuilder.buildObjectClassificationPrompt(
-                        input, baseline != null ? baseline.optString("detected_object_phrase", "") : "",
-                        spacyAnalysisJson, config);
-                long generationStarted = System.currentTimeMillis();
-                try {
-                    slotRaw = engine.generate(prompt, LlmGenerationOptions.forSlotExtraction(config));
-                    logLong("slot LLM output: ", slotRaw);
-                } catch (Throwable t) {
-                    return failureWithSafeBaseline(
-                            failureJson(input, "slot_generation_failed", true, engine.getStatus(), "", null,
-                                    "Slot LLM generation failed: " + throwableMessage(t), t,
-                                    System.currentTimeMillis() - started, true),
-                            diagnostics, baseline, config, false, true, "", "", 0,
-                            System.currentTimeMillis() - generationStarted);
-                }
-                slotDuration = System.currentTimeMillis() - generationStarted;
-                try {
-                    llmResult = LlmJsonUtils.parseSingleObject(slotRaw);
-                } catch (Throwable t) {
-                    return failureWithSafeBaseline(
-                            failureJson(input, "slot_json_parse", true, engine.getStatus(), slotRaw, null,
-                                    "Slot classifier did not return exactly one JSON object: " + throwableMessage(t), t,
-                                    System.currentTimeMillis() - started, true),
-                            diagnostics, baseline, config, false, true, "", slotRaw, 0, slotDuration);
-                }
-                validationStarted = System.currentTimeMillis();
-                validation = LlmDroneCommandValidator.validateSemanticSlot(llmResult, baseline, action, input, config);
-                resolutionSource = "slot_llm";
-                stage = "slot_llm_validated";
-                promptTokens = LlmPromptBuilder.estimatePromptTokens(prompt);
-                outputTokens = LlmPromptBuilder.estimateOutputTokens(slotRaw);
-            } else {
-                String actionPrompt = LlmPromptBuilder.buildActionClassificationPrompt(input, spacyAnalysisJson, config);
-                long generationStarted = System.currentTimeMillis();
-                try {
-                    actionRaw = engine.generate(actionPrompt, LlmGenerationOptions.forActionClassification(config));
-                    logLong("action LLM output: ", actionRaw);
-                } catch (Throwable t) {
-                    return failureWithDiagnostics(
-                            failureJson(input, "action_generation_failed", true, engine.getStatus(), "", null,
-                                    "Action LLM generation failed: " + throwableMessage(t), t,
-                                    System.currentTimeMillis() - started, true),
-                            diagnostics, true, false, "", "", System.currentTimeMillis() - generationStarted, 0);
-                }
-                actionDuration = System.currentTimeMillis() - generationStarted;
-                JSONObject llmAction;
-                try {
-                    llmAction = LlmJsonUtils.parseSingleObject(actionRaw);
-                } catch (Throwable t) {
-                    return failureWithDiagnostics(
-                            failureJson(input, "action_json_parse", true, engine.getStatus(), actionRaw, null,
-                                    "Action classifier did not return exactly one JSON object: " + throwableMessage(t), t,
-                                    System.currentTimeMillis() - started, true),
-                            diagnostics, true, false, actionRaw, "", actionDuration, 0);
-                }
-                String action = llmAction.optString("action", "").trim().toUpperCase(java.util.Locale.ROOT);
-                String detectedPhrase = detectedObjectPhrase(spacy, baseline);
-                if (LlmCommandSchema.supportsObject(action) && !detectedPhrase.isEmpty()) {
-                    String slotPrompt = LlmPromptBuilder.buildObjectClassificationPrompt(input, detectedPhrase, spacyAnalysisJson, config);
-                    generationStarted = System.currentTimeMillis();
-                    try {
-                        slotRaw = engine.generate(slotPrompt, LlmGenerationOptions.forSlotExtraction(config));
-                        logLong("slot LLM output: ", slotRaw);
-                    } catch (Throwable t) {
-                        return failureWithDiagnostics(
-                                failureJson(input, "slot_generation_failed", true, engine.getStatus(), actionRaw, llmAction,
-                                        "Slot LLM generation failed after action classification: " + throwableMessage(t), t,
-                                        System.currentTimeMillis() - started, true),
-                                diagnostics, true, true, actionRaw, "", actionDuration,
-                                System.currentTimeMillis() - generationStarted);
-                    }
-                    slotDuration = System.currentTimeMillis() - generationStarted;
-                    try {
-                        llmResult = LlmJsonUtils.parseSingleObject(slotRaw);
-                    } catch (Throwable t) {
-                        return failureWithDiagnostics(
-                                failureJson(input, "slot_json_parse", true, engine.getStatus(), slotRaw, llmAction,
-                                        "Slot classifier did not return exactly one JSON object: " + throwableMessage(t), t,
-                                        System.currentTimeMillis() - started, true),
-                                diagnostics, true, true, actionRaw, slotRaw, actionDuration, slotDuration);
-                    }
-                    validationStarted = System.currentTimeMillis();
-                    validation = LlmDroneCommandValidator.validateSemanticSlot(llmResult, baseline, action, input, config);
-                    resolutionSource = "action_llm+slot_llm";
-                    stage = "slot_llm_validated";
-                    promptTokens = LlmPromptBuilder.estimatePromptTokens(actionPrompt) + LlmPromptBuilder.estimatePromptTokens(slotPrompt);
-                    outputTokens = LlmPromptBuilder.estimateOutputTokens(actionRaw) + LlmPromptBuilder.estimateOutputTokens(slotRaw);
-                } else {
-                    llmResult = llmAction;
-                    validationStarted = System.currentTimeMillis();
-                    validation = LlmDroneCommandValidator.validateClassification(llmAction, baseline, config);
-                    resolutionSource = "action_llm";
-                    stage = "action_llm_validated";
-                    promptTokens = LlmPromptBuilder.estimatePromptTokens(actionPrompt);
-                    outputTokens = LlmPromptBuilder.estimateOutputTokens(actionRaw);
-                }
+            String semanticPrompt = LlmPromptBuilder.buildSemanticCommandPrompt(input, spacyAnalysisJson, config);
+            long generationStarted = System.currentTimeMillis();
+            try {
+                actionRaw = engine.generate(semanticPrompt, LlmGenerationOptions.forSemanticExtraction(config));
+                logLong("semantic LLM output: ", actionRaw);
+            } catch (Throwable t) {
+                return failureWithDiagnostics(
+                        failureJson(input, "semantic_generation_failed", true, engine.getStatus(), "", null,
+                                "Semantic LLM generation failed: " + throwableMessage(t), t,
+                                System.currentTimeMillis() - started, true),
+                        diagnostics, true, false, "", "", System.currentTimeMillis() - generationStarted, 0);
             }
+            actionDuration = System.currentTimeMillis() - generationStarted;
+            try {
+                llmResult = LlmJsonUtils.parseSingleObject(actionRaw);
+            } catch (Throwable t) {
+                return failureWithDiagnostics(
+                        failureJson(input, "semantic_json_parse", true, engine.getStatus(), actionRaw, null,
+                                "Semantic parser did not return exactly one JSON object: " + throwableMessage(t), t,
+                                System.currentTimeMillis() - started, true),
+                        diagnostics, true, false, actionRaw, "", actionDuration, 0);
+            }
+            validationStarted = System.currentTimeMillis();
+            validation = LlmDroneCommandValidator.validateSemanticResult(llmResult, baseline, input, config);
+            promptTokens = LlmPromptBuilder.estimatePromptTokens(semanticPrompt);
+            outputTokens = LlmPromptBuilder.estimateOutputTokens(actionRaw);
 
             long validationDuration = System.currentTimeMillis() - validationStarted;
             diagnostics.put("action_llm_called", !actionRaw.isEmpty());
@@ -254,7 +184,7 @@ public final class OfflineLlmBridge {
             diagnostics.put("slot_llm_raw", slotRaw.isEmpty() ? JSONObject.NULL : slotRaw);
             diagnostics.put("action_llm_duration_ms", actionDuration);
             diagnostics.put("slot_llm_duration_ms", slotDuration);
-            diagnostics.put("slot_evidence_valid", !slotRaw.isEmpty() && validation.errors.length() == 0 && validation.command.has("object"));
+            diagnostics.put("slot_evidence_valid", validation.errors.length() == 0);
             String combinedRaw = !slotRaw.isEmpty() ? slotRaw : actionRaw;
             return enrich(successJson(input, stage, engine, engine.getStatus(), combinedRaw, llmResult, validation,
                     true, resolutionSource, promptTokens, outputTokens, validationDuration,
@@ -264,6 +194,200 @@ public final class OfflineLlmBridge {
             return failureJson(rawText, "offline_llm_bridge_failed", false, null, "", null,
                     throwableMessage(t), t, System.currentTimeMillis() - started, false);
         }
+    }
+
+    private static String classifyObjectSlot(
+            Context context, JSONObject config, JSONObject spacy, String spacyAnalysisJson,
+            String input, JSONObject baseline, JSONObject diagnostics, long started) throws Exception {
+        String fixedAction = evidenceAction(baseline);
+        String rawEvidence = unresolvedObjectPhrase(spacy);
+        String requestId = requestId(spacy);
+        Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                + " pre_llm_resolution_status=NEEDS_SLOT_CLASSIFICATION llm_task=slot_classification"
+                + " resolution_status=NEEDS_SLOT_CLASSIFICATION fixed_action=" + fixedAction
+                + " unresolved_field=object raw_slot_evidence=" + JSONObject.quote(rawEvidence)
+                + " action_llm_called=false slot_llm_started=true");
+
+        if (!LlmCommandSchema.supportsObject(fixedAction) || rawEvidence.isEmpty()) {
+            diagnostics.put("action_llm_called", false);
+            diagnostics.put("slot_llm_called", false);
+            diagnostics.put("slot_evidence_valid", false);
+            diagnostics.put("fixed_action", fixedAction);
+            diagnostics.put("unresolved_field", "object");
+            diagnostics.put("raw_slot_evidence", rawEvidence);
+            return enrich(unknownJson(input, "slot_evidence_absent", System.currentTimeMillis() - started, spacy), diagnostics);
+        }
+
+        OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
+        if (!engine.getStatus().initialized) {
+            return failureWithDiagnostics(
+                    backendFailureJson(input, engine.getStatus(), System.currentTimeMillis() - started),
+                    diagnostics, false, false, "", "", 0, 0);
+        }
+
+        String prompt = LlmPromptBuilder.buildObjectClassificationPrompt(
+                input, fixedAction, rawEvidence, spacyAnalysisJson, config);
+        String slotRaw;
+        long generationStartedNanos = System.nanoTime();
+        try {
+            slotRaw = engine.generate(prompt, LlmGenerationOptions.forSlotExtraction(config, rawEvidence));
+        } catch (Throwable t) {
+            long generationDuration = elapsedMs(generationStartedNanos);
+            logSlotFinal(requestId, "generation_failed", throwableMessage(t), "", "", "not_run", "not_run",
+                    true, "UNKNOWN", "fallback");
+            return failureWithDiagnostics(
+                    withLlmMetrics(failureJson(input, "slot_generation_failed", true, engine.getStatus(), "", null,
+                            "Object slot LLM generation failed: " + throwableMessage(t), t,
+                            System.currentTimeMillis() - started, true), generationMetrics(engine, generationDuration),
+                            0, 0, generationDuration),
+                    diagnostics, false, true, "", "", 0,
+                    generationDuration);
+        }
+        long generationDuration = elapsedMs(generationStartedNanos);
+        LlamaCppEngine.GenerationMetrics metrics = generationMetrics(engine, generationDuration);
+        Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                + " llm_raw_output=" + safeSingleLine(slotRaw)
+                + " raw_output_chars=" + slotRaw.length()
+                + " slot_llm_called=true");
+
+        JSONObject slotResult;
+        long parseStartedNanos = System.nanoTime();
+        try {
+            slotResult = LlmJsonUtils.parseSingleObject(slotRaw);
+        } catch (Throwable t) {
+            long parseDuration = elapsedMs(parseStartedNanos);
+            String rejectReason = throwableMessage(t);
+            Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                    + " parse_result=rejected parse_reject_reason=" + JSONObject.quote(rejectReason)
+                    + " llm_candidate_value= llm_evidence=");
+            logSlotFinal(requestId, "rejected", rejectReason, "", "", "not_run", "not_run",
+                    true, "UNKNOWN", "fallback");
+            return failureWithDiagnostics(
+                    withLlmMetrics(failureJson(input, "slot_json_parse", true, engine.getStatus(), slotRaw, null,
+                            "Object slot classifier did not return exactly one JSON object: " + throwableMessage(t), t,
+                            System.currentTimeMillis() - started, true), metrics, parseDuration, 0,
+                            generationDuration + parseDuration),
+                    diagnostics, false, true, "", slotRaw, 0, generationDuration);
+        }
+        long parseDuration = elapsedMs(parseStartedNanos);
+        String candidateValue = slotResult.optString("object", "");
+        String candidateEvidence = slotResult.optString("evidence", "");
+        Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                + " parse_result=accepted parse_reject_reason=NONE"
+                + " llm_candidate_value=" + candidateValue
+                + " llm_evidence=" + JSONObject.quote(candidateEvidence));
+
+        long validationStartedNanos = System.nanoTime();
+        LlmDroneCommandValidator.Result validation = LlmDroneCommandValidator.validateSemanticSlot(
+                slotResult, baseline, fixedAction, input, config);
+        long validationDuration = elapsedMs(validationStartedNanos);
+        boolean valid = validation.errors.length() == 0
+                && fixedAction.equals(validation.command.optString("action", ""))
+                && validation.command.has("object");
+        diagnostics.put("action_llm_called", false);
+        diagnostics.put("slot_llm_called", true);
+        diagnostics.put("slot_evidence_valid", valid);
+        diagnostics.put("fixed_action", fixedAction);
+        diagnostics.put("unresolved_field", "object");
+        diagnostics.put("raw_slot_evidence", rawEvidence);
+        diagnostics.put("action_llm_raw", JSONObject.NULL);
+        diagnostics.put("slot_llm_raw", slotRaw);
+        diagnostics.put("action_llm_duration_ms", 0);
+        diagnostics.put("slot_llm_duration_ms", generationDuration);
+        if (!valid) diagnostics.put("failure_stage", "slot_validation");
+        String finalAction = validation.command.optString("action", "UNKNOWN");
+        String validatorRejectReason = joinJsonArray(validation.errors);
+        String resolutionSource = valid ? "llm" : "slot_llm_rejected";
+        Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                + " slot_llm_called=true slot_evidence_valid=" + valid
+                + " validator_result=" + (validation.errors.length() == 0 ? "accepted" : "rejected")
+                + " validator_reject_reason=" + (validatorRejectReason.isEmpty() ? "NONE" : JSONObject.quote(validatorRejectReason))
+                + " final_action=" + finalAction
+                + " final_object=" + validation.command.optString("object", "")
+                + " final_resolution_status=" + finalResolutionStatus(validation.command)
+                + " resolution_source=" + resolutionSource);
+        String resultJson = successJson(
+                input, valid ? "slot_llm_validated" : "slot_llm_rejected",
+                engine, engine.getStatus(), slotRaw, slotResult, validation,
+                true, resolutionSource, metrics.promptTokens,
+                metrics.outputTokens, validationDuration,
+                System.currentTimeMillis() - started, spacy, generationDuration);
+        resultJson = withLlmMetrics(resultJson, metrics, parseDuration, validationDuration,
+                generationDuration + parseDuration + validationDuration);
+        return enrich(resultJson, diagnostics);
+    }
+
+    private static long elapsedMs(long startedNanos) {
+        return Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
+    }
+
+    private static LlamaCppEngine.GenerationMetrics generationMetrics(OfflineLlmEngine engine, long javaDurationMs) {
+        if (engine instanceof LlamaCppEngine) {
+            return ((LlamaCppEngine) engine).getLastGenerationMetrics();
+        }
+        return LlamaCppEngine.GenerationMetrics.empty();
+    }
+
+    private static String withLlmMetrics(String json, LlamaCppEngine.GenerationMetrics metrics,
+                                         long parseDuration, long validationDuration, long totalLlmDuration) {
+        try {
+            JSONObject payload = new JSONObject(json);
+            payload.put("llm_prompt_tokens", metrics.promptTokens);
+            payload.put("llm_prompt_tokens_exact", metrics.promptTokens > 0);
+            payload.put("llm_output_tokens", metrics.outputTokens);
+            payload.put("llm_output_tokens_exact", metrics.outputTokens > 0);
+            payload.put("llm_prompt_eval_duration", metrics.promptEvalMs);
+            payload.put("llm_prompt_eval_duration_ms", metrics.promptEvalMs);
+            payload.put("llm_first_token_duration", metrics.firstTokenMs);
+            payload.put("llm_first_token_duration_ms", metrics.firstTokenMs);
+            payload.put("llm_generation_duration", metrics.generationMs);
+            payload.put("llm_generation_duration_ms", metrics.generationMs);
+            payload.put("llm_native_total_duration_ms", metrics.totalMs);
+            payload.put("llm_parse_duration", parseDuration);
+            payload.put("llm_parse_duration_ms", parseDuration);
+            payload.put("validation_duration", validationDuration);
+            payload.put("validation_duration_ms", validationDuration);
+            payload.put("llm_total_duration", totalLlmDuration);
+            payload.put("llm_total_duration_ms", totalLlmDuration);
+            payload.put("native_json_early_stop", metrics.jsonEarlyStop);
+            payload.put("native_json_early_stop_reason", metrics.jsonEarlyStop
+                    ? "balanced_root_json_completed" : "eog_or_max_tokens");
+            payload.put("grammar_constrained", true);
+            payload.put("grammar_constraint_reason", "slot_exact_schema_allowlist_and_raw_evidence");
+            return payload.toString();
+        } catch (Throwable ignored) {
+            return json;
+        }
+    }
+
+    private static String safeSingleLine(String raw) {
+        return JSONObject.quote(raw != null ? raw : "");
+    }
+
+    private static String joinJsonArray(JSONArray values) {
+        if (values == null || values.length() == 0) return "";
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < values.length(); i++) {
+            if (result.length() > 0) result.append('|');
+            result.append(values.optString(i, ""));
+        }
+        return result.toString();
+    }
+
+    private static void logSlotFinal(String requestId, String parseResult, String parseRejectReason,
+                                     String candidateValue, String evidence, String validatorResult,
+                                     String validatorRejectReason, boolean slotCalled,
+                                     String finalStatus, String resolutionSource) {
+        Log.i(TAG, "[NLP-SlotRouting] request_id=" + requestId
+                + " parse_result=" + parseResult
+                + " parse_reject_reason=" + (parseRejectReason.isEmpty() ? "NONE" : JSONObject.quote(parseRejectReason))
+                + " llm_candidate_value=" + candidateValue
+                + " llm_evidence=" + JSONObject.quote(evidence)
+                + " validator_result=" + validatorResult
+                + " validator_reject_reason=" + (validatorRejectReason.isEmpty() ? "NONE" : JSONObject.quote(validatorRejectReason))
+                + " slot_llm_called=" + slotCalled
+                + " final_resolution_status=" + finalStatus
+                + " resolution_source=" + resolutionSource);
     }
 
     private static String successJson(
@@ -409,6 +533,9 @@ public final class OfflineLlmBridge {
                 copy.put("action_evidence", hints.optJSONObject("action_evidence"));
                 copy.put("evidence_supported_actions", hints.optJSONArray("evidence_supported_actions"));
             }
+            copy.put("analysis_input", spacy != null ? spacy.optString("analysis_input", "") : "");
+            copy.put("semantic_frame", spacy != null ? spacy.optJSONObject("semantic_frame") : JSONObject.NULL);
+            copy.put("protected_spans", spacy != null ? spacy.optJSONArray("protected_spans") : JSONObject.NULL);
             return copy;
         } catch (Throwable ignored) {
             return candidate;
@@ -429,6 +556,34 @@ public final class OfflineLlmBridge {
         JSONObject compact = spacy != null ? spacy.optJSONObject("compact_evidence") : null;
         JSONArray candidates = compact != null ? compact.optJSONArray("object_phrase_candidates") : null;
         return candidates != null && candidates.length() > 0 ? candidates.optString(0, "").trim() : "";
+    }
+
+    private static String unresolvedObjectPhrase(JSONObject spacy) {
+        JSONObject frame = spacy != null ? spacy.optJSONObject("semantic_frame") : null;
+        JSONArray spans = frame != null ? frame.optJSONArray("object_spans") : null;
+        if (spans == null) return "";
+        for (int i = 0; i < spans.length(); i++) {
+            JSONObject span = spans.optJSONObject(i);
+            if (span == null || !"OBJECT".equals(span.optString("type", ""))) continue;
+            if (!"object".equals(span.optString("field", ""))) continue;
+            if (!"spacy_predicate_object_phrase".equals(span.optString("source", ""))) continue;
+            if (span.has("value") && !span.isNull("value")) continue;
+            if (span.has("canonical_value") && !span.isNull("canonical_value")) continue;
+            String text = span.optString("text", "").trim();
+            if (!text.isEmpty()) return text;
+        }
+        return "";
+    }
+
+    private static String requestId(JSONObject spacy) {
+        String value = spacy != null ? spacy.optString("request_id", "").trim() : "";
+        if (!value.isEmpty()) return value;
+        try {
+            JSONObject context = new JSONObject(spacy != null ? spacy.optString("context_json", "{}") : "{}");
+            value = context.optString("request_id", "").trim();
+        } catch (Throwable ignored) {
+        }
+        return value.isEmpty() ? "-" : value;
     }
 
     private static String canonicalInput(JSONObject spacy, String rawText) {

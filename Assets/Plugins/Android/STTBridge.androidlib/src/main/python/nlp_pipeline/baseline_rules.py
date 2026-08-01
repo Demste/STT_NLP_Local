@@ -20,6 +20,7 @@ from .command_catalog import (
 from .command_recovery import build_recovery_candidates, make_suggestion
 from .command_text_repair import build_repair_candidates
 from .command_validation import validate_command
+from .semantic_routing import build_semantic_frame
 from .text_normalization import normalize_turkish_text
 
 OBJECTS = OBJECT_ALIASES
@@ -33,7 +34,13 @@ def build_baseline_hints(analysis: Dict[str, Any], original_text: str = "", requ
     command, metrics = parse_drone_command_with_diagnostics(text, request_key=request_key)
     intended_action = command.get("target_action") if command.get("action") == "MISSING_INFO" else command.get("action")
     resolution_status = metrics["resolution_status"]
-    final_parser = resolution_status in ("RESOLVED", "MISSING_USER_INFO", "OUT_OF_DOMAIN", "NEEDS_CONFIRMATION")
+    final_parser = (
+        resolution_status in ("RESOLVED", "MISSING_USER_INFO")
+        or (resolution_status == "OUT_OF_DOMAIN" and (
+            metrics.get("out_of_domain_final")
+            or metrics.get("safety_blocked")
+        ))
+    )
     return {
         "final_parser": final_parser,
         "resolution_status": resolution_status,
@@ -170,7 +177,7 @@ def evaluate_action_evidence(text: str, command: Dict[str, Any], metrics: Dict[s
     elif has_move_verb and not _has_any(phrase, "nokta", "konum", "bolge", "koordinat"):
         _add_evidence(supported, reasons, "MOVE_DIRECTION", "horizontal_movement_verb")
 
-    if has_turn_verb or _turn_direction(phrase) is not None:
+    if has_turn_verb:
         _add_evidence(supported, reasons, "TURN", "turn_phrase")
     if (_vertical_direction(phrase) is not None
             or _has_any(phrase, "yuksel", "alcal", "yukari cik", "asagi in")):
@@ -337,6 +344,20 @@ def _parse_candidate(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         metrics.update({"resolution_status": "NEEDS_ACTION_CLASSIFICATION", "detected_object_phrase": ""})
         return {"action": "UNKNOWN", "confidence": 0.0}, metrics
 
+    semantic_frame = build_semantic_frame(None, {"action_candidates": []}, phrase)
+    if semantic_frame.get("safety_blocked"):
+        metrics = _metrics(started, 0.0, 0.0, 0.0)
+        metrics.update({
+            "resolution_status": "OUT_OF_DOMAIN",
+            "detected_object_phrase": "",
+            "protected_spans": semantic_frame.get("protected_spans", []),
+            "safety_blocked": True,
+            "safety_reasons": semantic_frame.get("safety_reasons", []),
+            "explicit_out_of_domain": False,
+            "out_of_domain_final": False,
+        })
+        return {"action": "UNKNOWN", "confidence": 0.0}, metrics
+
     action_started = time.perf_counter()
     action, confidence = resolve_action(phrase)
     action_ms = _elapsed_ms(action_started)
@@ -361,6 +382,11 @@ def _parse_candidate(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         resolution_status = "MISSING_USER_INFO"
     metrics["resolution_status"] = resolution_status
     metrics["detected_object_phrase"] = detected_object_phrase
+    metrics["protected_spans"] = semantic_frame.get("protected_spans", [])
+    metrics["safety_blocked"] = False
+    metrics["safety_reasons"] = []
+    metrics["explicit_out_of_domain"] = _explicitly_out_of_domain(phrase)
+    metrics["out_of_domain_final"] = _obviously_out_of_domain(phrase)
     return command, metrics
 
 
@@ -498,13 +524,15 @@ def _mapped(phrase: str, values: Dict[str, str]) -> Optional[str]:
         key_tokens = key.split()
         starts = range(0, len(tokens) - len(key_tokens) + 1)
         if key == "arac":
-            starts = (0,)  # "araç bul" is CAR; modified phrases like "yük aracı" stay semantic.
+            starts = (0,) if len(tokens) >= len(key_tokens) else ()  # Modified phrases stay semantic.
         if any(_alias_at(tokens, start, key_tokens) for start in starts):
             return mapped
     return None
 
 
 def _alias_at(tokens: List[str], start: int, alias: List[str]) -> bool:
+    if start < 0 or start + len(alias) > len(tokens):
+        return False
     for offset, root in enumerate(alias):
         token = tokens[start + offset]
         if offset < len(alias) - 1:
@@ -675,6 +703,7 @@ def _explicitly_out_of_domain(phrase: str) -> bool:
         phrase,
         "bana bir siir yaz", "siir yaz", "durum nedir", "kabul et",
         "bulutlari izle", "bulutu izle", "tirnak isaretini bul", "tirnak isareti bul",
+        "fotograf cek", "resim cek",
     )
 
 

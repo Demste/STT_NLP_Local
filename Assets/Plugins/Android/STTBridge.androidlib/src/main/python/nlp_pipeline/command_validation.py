@@ -7,6 +7,7 @@ import math
 from typing import Any, Dict, List
 
 from .schema import ACTION_FIELDS, ACTION_IDS, DEFAULT_COMMAND_SCHEMA, PUBLIC_FIELDS, allowed_fields, load_config
+from .text_normalization import normalize_turkish_text
 
 NUMERIC_FIELDS = ("distance_m", "duration_s", "duration_min", "angle_deg", "speed_kmh", "marker_index")
 ENUM_FIELDS = {
@@ -142,6 +143,68 @@ def materialize_public_command(command: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def validate_candidate_record(
+    record: Dict[str, Any],
+    context_json: str = "",
+    diagnostics: Dict[str, List[str]] = None,
+) -> Dict[str, Any]:
+    """Validate one internally consistent command/evidence/text record.
+
+    Deterministic extractors and the spaCy resolver both enter through this
+    gate. It rejects safety-blocked frames and evidence which belongs to a
+    different text, slot, enum or numeric unit.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    source = record if isinstance(record, dict) else {}
+    command = source.get("command") if isinstance(source.get("command"), dict) else {}
+    evidence = source.get("evidence") if isinstance(source.get("evidence"), dict) else {}
+    frame = source.get("semantic_frame") if isinstance(source.get("semantic_frame"), dict) else {}
+    raw_text = str(source.get("raw_text") or "")
+    normalized_text = normalize_turkish_text(raw_text)
+
+    if frame.get("safety_blocked"):
+        errors.extend("safety_blocked:" + str(value) for value in frame.get("safety_reasons") or ["unknown"])
+
+    action = str(command.get("action") or "UNKNOWN").strip().upper()
+    if action not in ACTION_IDS:
+        errors.append("action_not_allowed")
+    if action not in ("UNKNOWN", "MISSING_INFO"):
+        action_evidence = str(evidence.get("action") or "").strip()
+        if not action_evidence or not _contains_evidence(normalized_text, action_evidence):
+            errors.append("action_evidence_not_in_transcript")
+
+    semantic_action = str(command.get("target_action") or action).strip().upper()
+    permitted = ACTION_FIELDS.get(semantic_action, set())
+    for field in command:
+        if field in ("action", "target_action", "confidence"):
+            continue
+        if field not in permitted:
+            errors.append("slot_not_allowed_for_action:" + field)
+
+    protected = frame.get("protected_spans") or []
+    for field, value in command.items():
+        if field not in permitted or value is None:
+            continue
+        slot_evidence = str(evidence.get(field) or "").strip()
+        if not slot_evidence or not _contains_evidence(normalized_text, slot_evidence):
+            errors.append("slot_evidence_not_in_transcript:" + field)
+            continue
+        if field in NUMERIC_FIELDS and not _numeric_evidence_matches(field, value, slot_evidence, protected):
+            errors.append("numeric_evidence_mismatch:" + field)
+        if field in ENUM_FIELDS and not _enum_evidence_matches(field, value, slot_evidence, protected):
+            errors.append("enum_evidence_mismatch:" + field)
+
+    validated = validate_command(command, context_json, {"errors": [], "warnings": []})
+    if errors:
+        validated = validate_command({"action": "UNKNOWN", "confidence": 0.0}, context_json)
+
+    if diagnostics is not None:
+        diagnostics["errors"] = errors
+        diagnostics["warnings"] = warnings
+    return validated
+
+
 def _first_missing(action: str, result: Dict[str, Any], source: Dict[str, Any]) -> str:
     if action == "GO_TO_LOCATION":
         if result.get("location_keyword") is None and result.get("coordinate") is None:
@@ -189,3 +252,56 @@ def _context_values(context_json: str) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except Exception:
         return {}
+
+
+def _contains_evidence(normalized_text: str, evidence: str) -> bool:
+    haystack = " " + normalized_text + " "
+    needle = normalize_turkish_text(evidence)
+    return bool(needle) and (" " + needle + " ") in haystack
+
+
+def _numeric_evidence_matches(field: str, value: Any, evidence: str, protected) -> bool:
+    expected_units = {
+        "distance_m": "METER",
+        "duration_s": "SECOND",
+        "duration_min": "MINUTE",
+        "angle_deg": "DEGREE",
+        "speed_kmh": "KMH",
+    }
+    expected = _number(value, integer=(field == "marker_index"))
+    if expected is None:
+        return False
+    if field == "marker_index":
+        return any(
+            span.get("type") == "MARKER_INDEX"
+            and _number(span.get("value"), integer=True) == expected
+            and _contains_evidence(normalize_turkish_text(evidence), str(span.get("text") or ""))
+            for span in protected or []
+        )
+    unit = expected_units.get(field)
+    for span in protected or []:
+        if span.get("type") != "QUANTITY" or span.get("unit") != unit:
+            continue
+        span_value = _number(span.get("value"))
+        if span_value == expected and _contains_evidence(normalize_turkish_text(evidence), str(span.get("text") or "")):
+            return True
+    return False
+
+
+def _enum_evidence_matches(field: str, value: Any, evidence: str, protected) -> bool:
+    span_type = {
+        "direction": "DIRECTION",
+        "turn_direction": "DIRECTION",
+        "object": "OBJECT",
+        "color": "COLOR",
+        "shape": "SHAPE",
+    }.get(field)
+    if span_type is None:
+        return field == "observe_mode"
+    normalized = str(value or "").strip().upper()
+    for span in protected or []:
+        if span.get("type") != span_type or str(span.get("value") or "").upper() != normalized:
+            continue
+        if _contains_evidence(normalize_turkish_text(evidence), str(span.get("text") or "")):
+            return True
+    return False
