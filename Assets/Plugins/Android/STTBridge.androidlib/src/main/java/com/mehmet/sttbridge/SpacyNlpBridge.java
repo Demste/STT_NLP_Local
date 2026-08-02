@@ -19,10 +19,6 @@ public final class SpacyNlpBridge {
 
     private SpacyNlpBridge() {}
 
-    public static String analyzeText(Context context, String text) {
-        return analyzeText(context, text, "");
-    }
-
     public static String analyzeText(Context context, String text, String contextJson) {
         try {
             if (context == null) {

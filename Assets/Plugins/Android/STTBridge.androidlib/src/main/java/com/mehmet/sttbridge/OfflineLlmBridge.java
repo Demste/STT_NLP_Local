@@ -61,38 +61,6 @@ public final class OfflineLlmBridge {
         }
     }
 
-    public static String runSmokePrompt(Context context, String configJson) {
-        long started = System.currentTimeMillis();
-        try {
-            if (context == null) throw new IllegalArgumentException("Context is null.");
-            JSONObject config = LlmCommandSchema.mergeWithDefault(configJson);
-            OfflineLlmEngine engine = acquireEngine(context.getApplicationContext(), config);
-            if (!engine.getStatus().initialized) {
-                return backendFailureJson("", engine.getStatus(), System.currentTimeMillis() - started);
-            }
-            String prompt = LlmPromptBuilder.buildSmokePrompt();
-            String raw = engine.generate(prompt, LlmGenerationOptions.forActionClassification(config));
-            JSONObject payload = new JSONObject();
-            payload.put("ok", true);
-            payload.put("contract_version", CONTRACT_VERSION);
-            payload.put("engine", ENGINE_NAME);
-            payload.put("backend", engine.getEngineName());
-            payload.put("stage", "smoke_generated");
-            payload.put("initialized", true);
-            payload.put("inference_ran", true);
-            payload.put("backend_status", engine.getStatus().toJson());
-            payload.put("llm_raw", raw);
-            payload.put("llm_prompt_tokens", LlmPromptBuilder.estimatePromptTokens(prompt));
-            payload.put("llm_prompt_tokens_exact", false);
-            payload.put("llm_output_tokens", LlmPromptBuilder.estimateOutputTokens(raw));
-            payload.put("llm_output_tokens_exact", false);
-            payload.put("durationMs", System.currentTimeMillis() - started);
-            return payload.toString();
-        } catch (Throwable t) {
-            return failureJson("", "smoke_generation_failed", true, null, "", null, throwableMessage(t), t, System.currentTimeMillis() - started, true);
-        }
-    }
-
     public static String parseCommand(Context context, String rawText, String spacyAnalysisJson, String configJson) {
         long started = System.currentTimeMillis();
         try {

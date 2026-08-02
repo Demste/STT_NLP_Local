@@ -71,50 +71,6 @@ namespace Game.NLP.Android
 #endif
         }
 
-        public static Task<string> RunSmokePromptAsync(
-            string configJson,
-            CancellationToken cancellationToken = default)
-        {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            return Task.Run(() =>
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                AndroidJNI.AttachCurrentThread();
-
-                try
-                {
-                    using AndroidJavaClass unityPlayer = new AndroidJavaClass(UnityPlayerClassName);
-                    using AndroidJavaObject activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
-
-                    if (activity == null)
-                    {
-                        return BuildUnavailableJson(string.Empty, "android_activity_null", "UnityPlayer.currentActivity is null.");
-                    }
-
-                    using AndroidJavaClass bridge = new AndroidJavaClass(BridgeClassName);
-                    string result = bridge.CallStatic<string>(
-                        "runSmokePrompt",
-                        activity,
-                        configJson ?? string.Empty);
-
-                    cancellationToken.ThrowIfCancellationRequested();
-                    return string.IsNullOrEmpty(result)
-                        ? BuildUnavailableJson(string.Empty, "android_bridge_returned_empty", "Android offline LLM smoke bridge returned an empty response.")
-                        : result;
-                }
-                finally
-                {
-                    AndroidJNI.DetachCurrentThread();
-                }
-            }, cancellationToken);
-#else
-            return Task.FromResult(BuildUnavailableJson(
-                string.Empty,
-                "editor_mock",
-                "Offline LLM smoke bridge runs only in an Android device build."));
-#endif
-        }
-
         public static Task<string> WarmUpAsync(
             string configJson,
             CancellationToken cancellationToken = default)

@@ -12,7 +12,6 @@ namespace Game.STT
         public string RootDirectory { get; }
         public string SessionId { get; }
         public string SessionDirectory { get; }
-        public string AudioSessionDirectory { get; }
         public string ResultTxtPath { get; }
         public string PublicRelativeDirectory { get; }
         public string PublicFolderDisplayPath { get; }
@@ -24,7 +23,6 @@ namespace Game.STT
             RootDirectory = BuildExternalRootDirectory();
             SessionId = "session_" + _createdAt.ToString("yyyyMMdd_HHmmss");
             SessionDirectory = Path.Combine(RootDirectory, "Sessions", SessionId);
-            AudioSessionDirectory = Path.Combine(RootDirectory, "Audio", SessionId);
             ResultTxtPath = Path.Combine(SessionDirectory, "result.txt");
             PublicRelativeDirectory = "Documents/PartTime/STT/" + SessionId;
             PublicFolderDisplayPath = "Internal Storage/" + PublicRelativeDirectory;
@@ -32,7 +30,6 @@ namespace Game.STT
 
             Directory.CreateDirectory(RootDirectory);
             Directory.CreateDirectory(SessionDirectory);
-            Directory.CreateDirectory(AudioSessionDirectory);
             EnsureSessionFile(language);
         }
 
@@ -49,11 +46,6 @@ namespace Game.STT
 #endif
         }
 
-        public string BuildAudioPath(string recordingLabel, string timestamp)
-        {
-            return Path.Combine(AudioSessionDirectory, $"audio_{recordingLabel}_{timestamp}.wav");
-        }
-
         public void EnsureSessionFile(string language)
         {
             if (File.Exists(ResultTxtPath)) return;
@@ -63,30 +55,6 @@ namespace Game.STT
                 $"CreatedAt: {_createdAt:yyyy-MM-dd HH:mm:ss}\n" +
                 $"Language: {language}\n\n";
             File.WriteAllText(ResultTxtPath, text, Encoding.UTF8);
-        }
-
-        public void AppendRecordingHeader(string recordingLabel, string audioPath)
-        {
-            string text =
-                $"[{recordingLabel}]\n" +
-                $"AudioFile: {audioPath}\n";
-            File.AppendAllText(ResultTxtPath, text, Encoding.UTF8);
-        }
-
-        public void AppendModelOutput(STTProvider provider, STTResult result)
-        {
-            string output = result != null && result.HasError
-                ? "HATA: " + result.error
-                : result?.text ?? string.Empty;
-
-            long durationMs = result?.durationMs ?? 0;
-            string line = $"{provider.ToDisplayName()}: {output} ({durationMs} ms)\n";
-            File.AppendAllText(ResultTxtPath, line, Encoding.UTF8);
-        }
-
-        public void AppendRecordingSeparator()
-        {
-            File.AppendAllText(ResultTxtPath, "\n", Encoding.UTF8);
         }
     }
 }

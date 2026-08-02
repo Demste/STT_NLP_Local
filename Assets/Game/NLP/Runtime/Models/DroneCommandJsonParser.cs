@@ -47,37 +47,6 @@ namespace Game.NLP
             return result;
         }
 
-        public static string ToCompactJson(ValidatedCommandResult value)
-        {
-            if (value == null) return "null";
-            List<string> fields = new List<string>(10);
-            Add(fields, "action", value.action);
-            Add(fields, "direction", value.direction);
-            Add(fields, "turn_direction", value.turn_direction);
-            Add(fields, "distance_m", value.distance_m);
-            Add(fields, "duration_s", value.duration_s);
-            Add(fields, "duration_min", value.duration_min);
-            Add(fields, "angle_deg", value.angle_deg);
-            Add(fields, "speed_kmh", value.speed_kmh);
-            Add(fields, "object", value.@object);
-            Add(fields, "target_action", value.target_action);
-            Add(fields, "color", value.color);
-            Add(fields, "shape", value.shape);
-            Add(fields, "marker_index", value.marker_index);
-            Add(fields, "location_keyword", value.location_keyword);
-            if (value.coordinate != null)
-            {
-                fields.Add("\"coordinate\":{\"lat\":" + Number(value.coordinate.lat) + ",\"lon\":" + Number(value.coordinate.lon) + "}");
-            }
-            Add(fields, "observe_mode", value.observe_mode);
-            Add(fields, "voice_type", value.voice_type);
-            Add(fields, "stt_confidence_level", value.stt_confidence_level);
-            Add(fields, "missing_field", value.missing_field);
-            Add(fields, "missing_message", value.missing_message);
-            fields.Add(Field("confidence", value.confidence));
-            return "{" + string.Join(",", fields) + "}";
-        }
-
         public static string ToPublicJson(ValidatedCommandResult value)
         {
             ValidatedCommandResult command = value ?? new ValidatedCommandResult { action = "UNKNOWN", confidence = 0d };
@@ -136,9 +105,6 @@ namespace Game.NLP
                 + "\"errors\":[],\"warnings\":[],\"durationMs\":" + durationMs.ToString(CultureInfo.InvariantCulture)
                 + ",\"total_duration_ms\":" + durationMs.ToString(CultureInfo.InvariantCulture) + "}";
         }
-
-        public static string BuildBaselineEnvelope(string input, string commandJson, long durationMs) =>
-            BuildBaselineEnvelope(input, input, input, "RESOLVED", false, commandJson, durationMs);
 
         public static string BuildEvidenceGateEnvelope(
             string rawInput,
@@ -207,9 +173,6 @@ namespace Game.NLP
         private static string Field(string key, string value) => "\"" + key + "\":" + (value == null ? "null" : "\"" + Escape(value) + "\"");
         private static string Field(string key, double? value) => "\"" + key + "\":" + (value.HasValue ? Number(value.Value) : "null");
         private static string Field(string key, long? value) => "\"" + key + "\":" + (value.HasValue ? value.Value.ToString(CultureInfo.InvariantCulture) : "null");
-        private static void Add(List<string> fields, string key, string value) { if (!string.IsNullOrWhiteSpace(value)) fields.Add(Field(key, value)); }
-        private static void Add(List<string> fields, string key, double? value) { if (value.HasValue) fields.Add(Field(key, value)); }
-        private static void Add(List<string> fields, string key, long? value) { if (value.HasValue) fields.Add(Field(key, value)); }
         private static string Number(double value) => value.ToString("0.################", CultureInfo.InvariantCulture);
         private static string Escape(string value) => value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
     }

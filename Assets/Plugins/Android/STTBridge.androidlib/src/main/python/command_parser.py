@@ -13,9 +13,9 @@ import time
 import traceback
 from typing import Any, Dict, Optional
 
-from nlp_pipeline.baseline_rules import build_baseline_hints, parse_drone_command, parse_drone_command_with_diagnostics
+from nlp_pipeline.baseline_rules import build_baseline_hints
 from nlp_pipeline.command_recovery import build_semantic_recovery_suggestions
-from nlp_pipeline.command_validation import materialize_public_command, validate_candidate_record, validate_command
+from nlp_pipeline.command_validation import materialize_public_command, validate_candidate_record
 from nlp_pipeline.semantic_routing import (
     build_protected_spans,
     build_semantic_frame,
@@ -23,7 +23,7 @@ from nlp_pipeline.semantic_routing import (
     resolve_semantic_candidate,
 )
 from nlp_pipeline.spacy_analysis import build_analysis, build_compact_evidence
-from nlp_pipeline.text_normalization import normalize_turkish, repair_common_mojibake
+from nlp_pipeline.text_normalization import repair_common_mojibake
 
 MODEL_NAME = "tr_core_news_md"
 CONTRACT_VERSION = "action_first_v3_20260713"
@@ -277,56 +277,6 @@ def _first_unresolved_object_span(frame: Dict[str, Any]) -> Optional[Dict[str, A
     return None
 
 
-def validate_llm_command(command_json: str, context_json: str = "") -> str:
-    try:
-        command = json.loads(command_json or "{}")
-    except Exception as exc:
-        diagnostics = {}
-        internal = validate_command({}, context_json, diagnostics)
-        public = materialize_public_command(internal)
-        return _json_dumps({
-            "ok": False,
-            "stage": "llm_json_parse_failed",
-            "error": str(exc),
-            "internal_validated_command": internal,
-            "public_command": public,
-            "validated_command": public,
-            "errors": diagnostics.get("errors", []),
-            "warnings": diagnostics.get("warnings", []),
-        })
-
-    action = str(command.get("action") or "UNKNOWN").strip().upper() if isinstance(command, dict) else "UNKNOWN"
-    context = _context_dict(context_json)
-    original = context.get("original_command") or context.get("input") or context.get("normalized_command") or ""
-    if isinstance(original, str) and original.strip():
-        evidence, evidence_metrics = parse_drone_command_with_diagnostics(original)
-    else:
-        evidence, evidence_metrics = {"action": "UNKNOWN", "confidence": 0.0}, {"evidence_supported_actions": []}
-    evidence_action = evidence.get("target_action") if evidence.get("action") == "MISSING_INFO" else evidence.get("action")
-    supported_actions = evidence_metrics.get("evidence_supported_actions") or []
-    if action == evidence_action:
-        candidate = dict(evidence)
-    elif action in supported_actions:
-        candidate = {"action": action, "confidence": 0.76}
-    else:
-        candidate = {"action": "UNKNOWN", "confidence": 0.0}
-    diagnostics = {}
-    validated = validate_command(candidate, context_json, diagnostics)
-    public = materialize_public_command(validated)
-    removed = [key for key in command if key != "action"] if isinstance(command, dict) else []
-    diagnostics.setdefault("warnings", []).extend("llm_field_removed:not_classification_field:" + key for key in removed)
-    return _json_dumps({
-        "ok": True,
-        "stage": "validated",
-        "internal_validated_command": validated,
-        "public_command": public,
-        "normalized_command": public,
-        "validated_command": public,
-        "errors": diagnostics.get("errors", []),
-        "warnings": diagnostics.get("warnings", []),
-    })
-
-
 def _context_dict(context_json: str) -> Dict[str, Any]:
     try:
         value = json.loads(context_json or "{}")
@@ -362,10 +312,6 @@ def _spacy_version() -> Optional[str]:
         return spacy.__version__
     except Exception:
         return None
-
-
-def _normalize_turkish(value: str) -> str:
-    return normalize_turkish(value)
 
 
 def _repair_common_mojibake(value: str) -> str:

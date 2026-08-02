@@ -69,10 +69,6 @@ def build_baseline_hints(analysis: Dict[str, Any], original_text: str = "", requ
     }
 
 
-def parse_drone_command(text: str) -> Dict[str, Any]:
-    return parse_drone_command_with_diagnostics(text)[0]
-
-
 def parse_drone_command_with_diagnostics(text: str, request_key: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     started = time.perf_counter()
     raw = text or ""

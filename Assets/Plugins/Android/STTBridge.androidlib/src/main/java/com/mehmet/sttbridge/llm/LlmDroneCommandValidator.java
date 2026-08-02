@@ -22,11 +22,6 @@ public final class LlmDroneCommandValidator {
 
     private LlmDroneCommandValidator() {}
 
-    /** Compatibility entrypoint: model payload is treated as classification only. */
-    public static Result validate(JSONObject modelOutput, JSONObject context) throws JSONException {
-        return validateClassification(modelOutput, null, context);
-    }
-
     /** Trusts values only because they came from the deterministic Python extractor. */
     public static Result validateBaseline(JSONObject evidence, JSONObject context) throws JSONException {
         JSONObject source = evidence != null ? evidence : LlmCommandSchema.defaultCommand();

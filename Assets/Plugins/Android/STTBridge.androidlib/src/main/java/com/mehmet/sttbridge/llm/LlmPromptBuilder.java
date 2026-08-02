@@ -8,17 +8,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-/** Builds bounded action-only and object-only classification prompts. */
+/** Builds bounded semantic and object-slot prompts. */
 public final class LlmPromptBuilder {
-    private static final String ACTION_SYSTEM =
-            "Türkçe drone komutunun niyetini sınıflandır. Yalnız kullanıcı metnindeki kanıtı kullan; slot uydurma. "
-            + "FIND_OBJECT=belirtilen fiziksel nesneyi arama veya tespit; TRACK_OBJECT=belirtilen nesneyi sürekli takip; "
-            + "HOLD_OVER_OBJECT=belirtilen nesnenin üzerinde konumu koruma; OBSERVE_CURRENT=mevcut konumdan çevreyi gözlemleme; "
-            + "HOVER=havada sabit kalma; STOP=mevcut hareketi durdurma; LAND_HOME=başlangıç/eve iniş; "
-            + "LAND_CURRENT=mevcut yere iniş; LAND_AT_WAIT_POINT=bekleme noktasına iniş; MOVE_VERTICAL=dikey mesafeli hareket; "
-            + "MOVE_DIRECTION=yatay yön ve mesafe hareketi. Diğer izinliler TAKE_OFF,SET_SPEED,TURN,GO_TO_LOCATION,FIND_MARKER. "
-            + "Niyet yoksa UNKNOWN. Yalnız {\"action\":\"ACTION\"} biçiminde tek JSON nesnesi yaz.";
-
     private static final String OBJECT_SYSTEM =
             "Tek görev: Türkçe RAW nesnesini sınıflandır. Ağır/yük taşıtı=TRUCK; kazı aracı=EXCAVATOR. "
             + "CANONICAL_HINT varsa onu kullan. ALLOWED listesinden seç ve RETURN şemasını doldur. Yalnız minified JSON yaz. "
@@ -34,18 +25,6 @@ public final class LlmPromptBuilder {
             + "{\"action\":\"ACTION\",\"action_evidence\":\"metin\",\"slots\":{\"slot\":{\"value\":\"VALUE\",\"evidence\":\"metin\"}}}.";
 
     private LlmPromptBuilder() {}
-
-    public static String build(String rawText, String spacyAnalysisJson, JSONObject config) {
-        return buildActionClassificationPrompt(rawText, spacyAnalysisJson, config);
-    }
-
-    public static String buildActionClassificationPrompt(String analysisInput, String spacyAnalysisJson, JSONObject config) {
-        return chat(ACTION_SYSTEM, analysisInput, compactEvidence(spacyAnalysisJson));
-    }
-
-    public static String buildObjectClassificationPrompt(String analysisInput, String detectedPhrase, String spacyAnalysisJson, JSONObject config) {
-        return buildObjectClassificationPrompt(analysisInput, "UNKNOWN", detectedPhrase, spacyAnalysisJson, config);
-    }
 
     public static String buildObjectClassificationPrompt(String analysisInput, String fixedAction,
                                                          String detectedPhrase, String spacyAnalysisJson,
@@ -88,10 +67,6 @@ public final class LlmPromptBuilder {
                 .append('\n').append(semanticFrameEvidence(spacyAnalysisJson))
                 .append('\n').append(compactEvidence(spacyAnalysisJson));
         return chat(SEMANTIC_SYSTEM, analysisInput, schema.toString());
-    }
-
-    public static String buildSmokePrompt() {
-        return build("15 metre yüksel", "{}", null);
     }
 
     public static String buildObjectGrammar(String rawEvidence) {
@@ -137,8 +112,6 @@ public final class LlmPromptBuilder {
         int bytes = safe(output).getBytes(StandardCharsets.UTF_8).length;
         return Math.max(0, (bytes + 3) / 4);
     }
-
-    static String classificationInstruction() { return ACTION_SYSTEM; }
 
     private static List<String> semanticCandidates(String spacyAnalysisJson) {
         List<String> result = new ArrayList<>();

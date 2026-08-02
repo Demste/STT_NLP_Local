@@ -57,21 +57,6 @@ public final class LlmGenerationOptions {
                 clampTemperature(slotTemperature), "");
     }
 
-    public static LlmGenerationOptions forActionClassification(JSONObject config) {
-        LlmGenerationOptions base = fromConfig(config);
-        return new LlmGenerationOptions(
-                base.classificationMaxTokens,
-                base.classificationTemperature,
-                base.topP,
-                base.topK,
-                base.contextSize,
-                base.threads,
-                base.classificationMaxTokens,
-                base.slotMaxTokens,
-                base.classificationTemperature,
-                base.slotTemperature, "");
-    }
-
     public static LlmGenerationOptions forSlotExtraction(JSONObject config) {
         LlmGenerationOptions base = fromConfig(config);
         return new LlmGenerationOptions(

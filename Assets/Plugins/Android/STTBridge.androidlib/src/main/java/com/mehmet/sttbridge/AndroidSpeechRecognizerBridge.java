@@ -686,14 +686,6 @@ public final class AndroidSpeechRecognizerBridge {
         return "ON_DEVICE".equals(selected) ? Mode.OFFLINE : Mode.valueOf(selected);
     }
 
-    static String selectModeNameForTesting(String requestedValue, boolean validatedInternet,
-                                           boolean standardAvailable, int apiLevel,
-                                           boolean onDeviceAvailable, boolean offlineReadyOrUsable) {
-        return selectModeNameForTesting(requestedValue, "AVAILABLE",
-                Boolean.toString(validatedInternet), standardAvailable, apiLevel,
-                onDeviceAvailable, offlineReadyOrUsable);
-    }
-
     static String selectModeNameForTesting(String requestedValue, String networkStateValue,
                                            String networkValidatedValue, boolean standardAvailable,
                                            int apiLevel, boolean onDeviceAvailable,
@@ -709,13 +701,6 @@ public final class AndroidSpeechRecognizerBridge {
         if (networkKnownUnavailable && canUseOffline) return "ON_DEVICE";
         if (standardAvailable) return Mode.ONLINE.name();
         return canUseOffline ? "ON_DEVICE" : "";
-    }
-
-    static String selectionReasonForTesting(String requestedValue, boolean standardAvailable,
-                                            int apiLevel, boolean onDeviceAvailable,
-                                            boolean offlineReadyOrUsable) {
-        return selectionReasonForTesting(requestedValue, "UNKNOWN", "unknown", standardAvailable,
-                apiLevel, onDeviceAvailable, offlineReadyOrUsable);
     }
 
     static String selectionReasonForTesting(String requestedValue, String networkStateValue,
@@ -739,12 +724,6 @@ public final class AndroidSpeechRecognizerBridge {
     }
 
     static boolean shouldRetryOnDeviceForTesting(String requestedValue, String usedValue,
-                                                  boolean alreadyRetried, boolean turkishReady, int error) {
-        return shouldRetryOnDeviceForTesting(requestedValue, usedValue, alreadyRetried,
-                turkishReady, isNetworkError(error), error);
-    }
-
-    static boolean shouldRetryOnDeviceForTesting(String requestedValue, String usedValue,
                                                   boolean alreadyRetried, boolean onDeviceAvailable,
                                                   boolean networkErrorSeen, int error) {
         return parseMode(requestedValue) == Mode.AUTO && parseMode(usedValue) == Mode.ONLINE
@@ -752,38 +731,6 @@ public final class AndroidSpeechRecognizerBridge {
                 && (isNetworkError(error)
                     || (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
                         && networkErrorSeen));
-    }
-
-    static String userErrorForTesting(int error) {
-        return userErrorAtApi(error, 35);
-    }
-
-    static String sessionErrorForTesting(String usedValue, int error, boolean onDeviceAvailable) {
-        Mode used = parseMode(usedValue);
-        Session session = new Session("test", used, used, "", "");
-        return sessionError(session, error, onDeviceAvailable);
-    }
-
-    static boolean onlineUsableAfterSupportErrorForTesting(boolean standardAvailable, int error) {
-        // checkRecognitionSupport is advisory; actual recognition callbacks update the cache.
-        return standardAvailable;
-    }
-
-    static String supportStatusForErrorForTesting(int error) {
-        return supportStatusForErrorAtApi(error, 33).name();
-    }
-
-    static boolean warmupSuccessForTesting(String requestedMode, boolean validatedInternet,
-                                           boolean onlineCanStart, int apiLevel,
-                                           boolean onDeviceAvailable, boolean offlineCanStart) {
-        return !selectModeNameForTesting(requestedMode, validatedInternet, onlineCanStart,
-                apiLevel, onDeviceAvailable, offlineCanStart).isEmpty();
-    }
-
-    static boolean optionalExtrasEnabledAfterSupportErrorForTesting(int error) {
-        // Any capability-query error, including ERROR_CANNOT_CHECK_SUPPORT, means
-        // startListening must fall back to the safe base intent.
-        return false;
     }
 
     private static SupportStatus supportStatusForError(int error) {
